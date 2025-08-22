@@ -101,7 +101,7 @@ fn zoom_and_extract_account_holder(
     img: &DynamicImage,
     text_lines: Vec<TextLine>,
     name: &str,
-) -> Option<Vec<String>> {
+) -> Option<String> {
     let code_postal_line_regex = Regex::new(r"[[:space:]]*\d{5}\s+[[:alpha:]]").unwrap();
     let code_postal_word_regex = Regex::new(r"^\d{5}").unwrap();
 

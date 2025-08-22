@@ -2,7 +2,7 @@ use regex::Regex;
 
 use super::patch::{right_complete, Patch};
 
-pub fn find_simple_account_holder(text: &str, nb_line: usize) -> Option<Vec<String>> {
+pub fn find_simple_account_holder(text: &str, nb_line: usize) -> Option<String> {
     let account_holder = Regex::new(r"(?i)(titulaire)").unwrap();
     let stop = Regex::new(r"(?i)(domiciliation|cadre réservé|identification)").unwrap();
     let lines: Vec<&str> = text.lines().collect();
@@ -24,7 +24,7 @@ pub fn find_simple_account_holder(text: &str, nb_line: usize) -> Option<Vec<Stri
     };
 
     if result.is_some() {
-        return result;
+        return result.map(|r| r.join("\n"));
     }
 
     // last chance, try for one line by civilite
@@ -37,7 +37,7 @@ pub fn find_simple_account_holder(text: &str, nb_line: usize) -> Option<Vec<Stri
         let start = m.start();
 
         return right_complete(lines[index], start, m.end() - 1)
-            .map(|end| vec![lines[index][start..=end].trim().to_string()]);
+            .map(|end| lines[index][start..=end].trim().to_string());
     }
 
     None

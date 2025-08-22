@@ -10,14 +10,14 @@ use crate::{
 
 #[derive(Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct Rib {
-    account_holder: Option<Vec<String>>,
+    account_holder: Option<String>,
     iban: String,
     bic: Option<String>,
     bank_name: Option<String>,
 }
 
 impl Rib {
-    pub fn from_iban(iban: String, account_holder: Option<Vec<String>>, bic: Option<String>) -> Self {
+    pub fn from_iban(iban: String, account_holder: Option<String>, bic: Option<String>) -> Self {
         let bank_name = IbanToBankName::new().bank_name(&iban);
 
         Rib {
@@ -29,7 +29,7 @@ impl Rib {
     }
     pub fn parse(text: String) -> Option<Self> {
         let account_holder = find_account_holder_addr(&text)
-            .map(|addr| addr.lines())
+            .map(|addr| addr.lines().join("\n"))
             .or_else(|| find_simple_account_holder(&text, 3));
 
         let bic = extract_fr_bic(&text);
@@ -245,10 +245,6 @@ mod tests {
         assert_eq!(extract_iban(iban_with_faults).unwrap(), iban);
     }
 
-    fn vec_to_string(v: Vec<&str>) -> Vec<String> {
-        v.iter().map(|x| x.to_string()).collect()
-    }
-
     fn to_rib(path: &str) -> Rib {
         let layout_text = std::fs::read_to_string(path).unwrap();
         Rib::parse(layout_text).unwrap_or_else(|| {
@@ -257,7 +253,7 @@ mod tests {
     }
 
     fn test_file(path: &str, account_holder: Option<Vec<&str>>, iban: &str, bic: &str) {
-        let account_holder = account_holder.map(vec_to_string);
+        let account_holder = account_holder.map(|v| v.join("\n"));
         assert_eq!(
             to_rib(path),
             Rib {
