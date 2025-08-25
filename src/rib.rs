@@ -5,32 +5,32 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     fi_extract::IbanToBankName,
-    text::{address::find_titulaire_addr, simple_titulaire::find_simple_titulaire},
+    text::{address::find_account_holder_addr, simple_account_holder::find_simple_account_holder},
 };
 
 #[derive(Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct Rib {
-    titulaire: Option<Vec<String>>,
+    account_holder: Option<String>,
     iban: String,
     bic: Option<String>,
     bank_name: Option<String>,
 }
 
 impl Rib {
-    pub fn from_iban(iban: String, titulaire: Option<Vec<String>>, bic: Option<String>) -> Self {
+    pub fn from_iban(iban: String, account_holder: Option<String>, bic: Option<String>) -> Self {
         let bank_name = IbanToBankName::new().bank_name(&iban);
 
         Rib {
-            titulaire,
+            account_holder,
             iban,
             bic,
             bank_name,
         }
     }
     pub fn parse(text: String) -> Option<Self> {
-        let titulaire = find_titulaire_addr(&text)
-            .map(|addr| addr.lines())
-            .or_else(|| find_simple_titulaire(&text, 3));
+        let account_holder = find_account_holder_addr(&text)
+            .map(|addr| addr.lines().join("\n"))
+            .or_else(|| find_simple_account_holder(&text, 3));
 
         let bic = extract_fr_bic(&text);
 
@@ -38,7 +38,7 @@ impl Rib {
             let bank_name = IbanToBankName::new().bank_name(&iban);
 
             Some(Rib {
-                titulaire,
+                account_holder,
                 iban,
                 bic,
                 bank_name,
@@ -245,10 +245,6 @@ mod tests {
         assert_eq!(extract_iban(iban_with_faults).unwrap(), iban);
     }
 
-    fn vec_to_string(v: Vec<&str>) -> Vec<String> {
-        v.iter().map(|x| x.to_string()).collect()
-    }
-
     fn to_rib(path: &str) -> Rib {
         let layout_text = std::fs::read_to_string(path).unwrap();
         Rib::parse(layout_text).unwrap_or_else(|| {
@@ -256,12 +252,12 @@ mod tests {
         })
     }
 
-    fn test_file(path: &str, titulaire: Option<Vec<&str>>, iban: &str, bic: &str) {
-        let titulaire = titulaire.map(vec_to_string);
+    fn test_file(path: &str, account_holder: Option<Vec<&str>>, iban: &str, bic: &str) {
+        let account_holder = account_holder.map(|v| v.join("\n"));
         assert_eq!(
             to_rib(path),
             Rib {
-                titulaire,
+                account_holder,
                 iban: iban.to_string(),
                 bic: Some(bic.to_string()),
                 bank_name: None
@@ -274,206 +270,206 @@ mod tests {
     #[test]
     fn rib_banque_populaire() {
         let path = "tests/fixtures/rib/banque_populaire.txt";
-        let titulaire = Some(vec![
+        let account_holder = Some(vec![
             "M OU MME MATISSE HENRI",
             "51 RUE BERNARD ROY",
             "44100 NANTES",
         ]);
         let bic = "BDFEFRPPCCT";
-        test_file(path, titulaire, IBAN, bic);
+        test_file(path, account_holder, IBAN, bic);
     }
 
     #[test]
     fn rib_banque_populaire_2() {
         let path = "tests/fixtures/rib/banque_populaire_2.txt";
-        let titulaire = Some(vec![
+        let account_holder = Some(vec![
             "M HENRI MATISSE OU MLLE",
             "FRIDA KAHLO",
             "31 AVENUE JULES RENARD",
             "44800 ST HERBLAIN",
         ]);
         let bic = "BDFEFRPPCCT";
-        test_file(path, titulaire, IBAN, bic);
+        test_file(path, account_holder, IBAN, bic);
     }
 
     #[test]
     fn rib_banque_postale() {
         let path = "tests/fixtures/rib/banque_postale.txt";
-        let titulaire = Some(vec![
+        let account_holder = Some(vec![
             "MR MATISSE HENRI",
             "243 RUE DES GRIVES",
             "44240 LA CHAPELLE SUR ERDRE",
         ]);
         let bic = "PSSTFRPPNTE";
-        test_file(path, titulaire, IBAN, bic);
+        test_file(path, account_holder, IBAN, bic);
     }
 
     #[test]
     fn rib_banque_postale_2() {
         let path = "tests/fixtures/rib/banque_postale_2.txt";
-        let titulaire = Some(vec!["MLE FRIDA KHALO", "OU MR MATISSE HENRI"]);
+        let account_holder = Some(vec!["MLE FRIDA KHALO", "OU MR MATISSE HENRI"]);
         let bic = "PSSTFRPPNTE";
-        test_file(path, titulaire, IBAN, bic);
+        test_file(path, account_holder, IBAN, bic);
     }
 
     #[test]
     fn rib_bourso() {
         let path = "tests/fixtures/rib/bourso.txt";
-        let titulaire = Some(vec![
+        let account_holder = Some(vec![
             "Mlle Kahlo Frida",
             "55 CHEMIN DU PETIT BOIS",
             "44400 REZE",
         ]);
         let bic = "BOUS FRPP XXX";
-        test_file(path, titulaire, IBAN, bic);
+        test_file(path, account_holder, IBAN, bic);
     }
 
     #[test]
     fn rib_caisse_epargne() {
         let path = "tests/fixtures/rib/caisse_epargne.txt";
-        let titulaire = Some(vec![
+        let account_holder = Some(vec![
             "MME KAHLO FRIDA OU M MATISSE",
             "143 ALLEE DES SALICAIRES",
             "44240 LA CHAPELLE SUR ERDRE",
         ]);
         let bic = "CEPAFRPP444";
-        test_file(path, titulaire, IBAN, bic);
+        test_file(path, account_holder, IBAN, bic);
     }
 
     #[test]
     fn rib_caisse_epargne_2() {
         let path = "tests/fixtures/rib/caisse_epargne_2.txt";
-        let titulaire = Some(vec![
+        let account_holder = Some(vec![
             "M MATISSE HENRI",
             "12 RUE VICTOR FORTUN",
             "44400 REZE",
         ]);
         let bic = "CEPAFRPP444";
-        test_file(path, titulaire, IBAN, bic);
+        test_file(path, account_holder, IBAN, bic);
     }
 
     #[test]
     fn rib_caisse_epargne_3() {
         let path = "tests/fixtures/rib/caisse_epargne_3.txt";
-        let titulaire = Some(vec![
+        let account_holder = Some(vec![
             "ML KHALO FRIDA OU M MATISSE H",
             "35 RUE DU CEDRE",
             "44240 LA CHAPELLE SUR ERDRE",
         ]);
         let bic = "CEPAFRPP444";
-        test_file(path, titulaire, IBAN, bic);
+        test_file(path, account_holder, IBAN, bic);
     }
 
     #[test]
     fn rib_credit_agricole() {
         let path = "tests/fixtures/rib/credit_agricole.txt";
-        let titulaire = Some(vec![
+        let account_holder = Some(vec![
             "MR OU MME MATISSE",
             "HENRI",
             "32 RUE EDOUARD TRAVIES",
             "44240 LA CHAPELLE SUR ERDRE",
         ]);
         let bic = "AGRIFRPP847";
-        test_file(path, titulaire, IBAN, bic);
+        test_file(path, account_holder, IBAN, bic);
     }
 
     #[test]
     fn rib_credit_agricole_2() {
         let path = "tests/fixtures/rib/credit_agricole_2.txt";
-        let titulaire = Some(vec!["MME KAHLO FRIDA"]);
+        let account_holder = Some(vec!["MME KAHLO FRIDA"]);
         let bic = "AGRIFRPP847";
-        test_file(path, titulaire, IBAN, bic);
+        test_file(path, account_holder, IBAN, bic);
     }
 
     #[test]
     fn rib_credit_agricole_3() {
         let path = "tests/fixtures/rib/credit_agricole_3.txt";
-        let titulaire = Some(vec![
+        let account_holder = Some(vec![
             "MLLE FRIDA KHALO",
             "15 RUE MARYSE BASTIE",
             "44230 ST SEBASTIEN SUR LOIRE",
         ]);
         let bic = "AGRIFRPP847";
-        test_file(path, titulaire, IBAN, bic);
+        test_file(path, account_holder, IBAN, bic);
     }
 
     #[test]
     fn rib_credit_mutuel() {
         let path = "tests/fixtures/rib/credit_mutuel.txt";
-        let titulaire = Some(vec![
+        let account_holder = Some(vec![
             "M HENRI MATISSE",
             "123 ALLEE DES ROSES",
             "44640 LE PELLERIN",
         ]);
         let bic = "CMCIFR2A";
-        test_file(path, titulaire, IBAN, bic);
+        test_file(path, account_holder, IBAN, bic);
     }
 
     #[test]
     fn rib_credit_mutuel_2() {
         let path = "tests/fixtures/rib/credit_mutuel_2.txt";
-        let titulaire = Some(vec![
+        let account_holder = Some(vec![
             "M OU MME MATISSE HENRI",
             "54 RUE DE L HERONNIERE",
             "44000 NANTES",
         ]);
         let bic = "CMBRFR2BXXX";
-        test_file(path, titulaire, IBAN, bic);
+        test_file(path, account_holder, IBAN, bic);
     }
 
     #[test]
     fn rib_fortuneo() {
         let path = "tests/fixtures/rib/fortuneo.txt";
-        let titulaire = Some(vec!["Madame Khalo Frida ou Monsieur Matisse Henri"]);
+        let account_holder = Some(vec!["Madame Khalo Frida ou Monsieur Matisse Henri"]);
         let bic = "FTNOFRP1XXX";
-        test_file(path, titulaire, IBAN, bic);
+        test_file(path, account_holder, IBAN, bic);
     }
 
     #[test]
     fn rib_lcl() {
         let path = "tests/fixtures/rib/lcl.txt";
-        let titulaire = Some(vec!["M MATISSE HENRI"]);
+        let account_holder = Some(vec!["M MATISSE HENRI"]);
         let bic = "CRLYFRPP";
-        test_file(path, titulaire, IBAN, bic);
+        test_file(path, account_holder, IBAN, bic);
     }
 
     #[test]
     fn rib_lcl_2() {
         let path = "tests/fixtures/rib/lcl_2.txt";
-        let titulaire = Some(vec!["MLLE FRIDA KHALO"]);
+        let account_holder = Some(vec!["MLLE FRIDA KHALO"]);
         let bic = "CRLYFRPP";
-        test_file(path, titulaire, IBAN, bic);
+        test_file(path, account_holder, IBAN, bic);
     }
 
     #[test]
     fn rib_sg() {
         let path = "tests/fixtures/rib/sg.txt";
-        let titulaire = Some(vec![
+        let account_holder = Some(vec![
             "Mlle Frida Khalo",
             "117 rue des bourdonnieres 204 batiment c",
             "44200 Nantes",
         ]);
         let bic = "SOGEFRPP";
-        test_file(path, titulaire, IBAN, bic);
+        test_file(path, account_holder, IBAN, bic);
     }
 
     #[test]
     fn rib_sg_2() {
         let path = "tests/fixtures/rib/sg_2.txt";
-        let titulaire = Some(vec![
+        let account_holder = Some(vec![
             "SAS HENRI MATISSE",
             "18 RUE SADI CARNOT",
             "92120 MONTROUGE",
         ]);
         let bic = "SOGEFRPP";
-        test_file(path, titulaire, IBAN, bic);
+        test_file(path, account_holder, IBAN, bic);
     }
 
     #[test]
     fn rib_orange() {
         let path = "tests/fixtures/rib/orange.txt";
-        let titulaire = Some(vec!["M Matisse Henri"]);
+        let account_holder = Some(vec!["M Matisse Henri"]);
         let bic = "GPBAFRPPXXX";
-        test_file(path, titulaire, IBAN, bic);
+        test_file(path, account_holder, IBAN, bic);
     }
 }

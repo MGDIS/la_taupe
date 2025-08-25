@@ -85,7 +85,7 @@ impl Anchor {
         (x, y, wrapping_width, wrapping_height)
     }
 
-    pub fn titulaire_mask(&self) -> (u32, u32, u32, u32) {
+    pub fn account_holder_mask(&self) -> (u32, u32, u32, u32) {
         let x = self
             .top_left
             .x

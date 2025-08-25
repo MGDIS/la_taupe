@@ -37,7 +37,7 @@ impl Addr {
     }
 }
 
-pub fn find_titulaire_addr(text: &str) -> Option<Addr> {
+pub fn find_account_holder_addr(text: &str) -> Option<Addr> {
     let lines: Vec<&str> = text.split("\n").collect();
     let code_postal = Regex::new(r"(^| )\d{5} ([[:alpha:]]+ ?)+").unwrap();
     let patch_upper_limit =
@@ -89,12 +89,12 @@ pub fn find_titulaire_addr(text: &str) -> Option<Addr> {
 }
 
 fn addr_type_from_text(patch: &Patch) -> AddrType {
-    let titulaire = Regex::new(r"(?i)(titulaire|intitulé)").unwrap();
+    let account_holder = Regex::new(r"(?i)(titulaire|intitulé)").unwrap();
     let domiciliation = Regex::new(r"(?i)(domiciliation|cadre réservé)").unwrap();
 
     let text = patch.lines().join(" ");
 
-    if titulaire.is_match(&text) {
+    if account_holder.is_match(&text) {
         return AddrType::Titulaire;
     } else if domiciliation.is_match(&text) {
         return AddrType::Domiciliation;
@@ -102,7 +102,7 @@ fn addr_type_from_text(patch: &Patch) -> AddrType {
 
     let context = patch.context_lines.join(" ");
 
-    if titulaire.is_match(&context) {
+    if account_holder.is_match(&context) {
         return AddrType::Titulaire;
     } else if domiciliation.is_match(&context) {
         return AddrType::Domiciliation;
@@ -118,46 +118,46 @@ mod tests {
         v.iter().map(|x| x.to_string()).collect()
     }
 
-    fn test_file(path: &str, titulaire: Vec<&str>) {
+    fn test_file(path: &str, account_holder: Vec<&str>) {
         let layout_text = std::fs::read_to_string(path).unwrap();
-        let titulaire = Some(vec_to_string(titulaire));
-        let addrs = find_titulaire_addr(&layout_text);
-        assert_eq!(addrs.map(|a| a.lines()), titulaire);
+        let account_holder = Some(vec_to_string(account_holder));
+        let addrs = find_account_holder_addr(&layout_text);
+        assert_eq!(addrs.map(|a| a.lines()), account_holder);
     }
 
     #[test]
     fn addr_banque_populaire() {
         let path = "tests/fixtures/rib/banque_populaire.txt";
-        let titulaire = vec![
+        let account_holder = vec![
             "M OU MME MATISSE HENRI",
             "51 RUE BERNARD ROY",
             "44100 NANTES",
         ];
 
-        test_file(path, titulaire);
+        test_file(path, account_holder);
     }
 
     #[test]
     fn addr_banque_postale() {
         let path = "tests/fixtures/rib/banque_postale.txt";
-        let titulaire = vec![
+        let account_holder = vec![
             "MR MATISSE HENRI",
             "243 RUE DES GRIVES",
             "44240 LA CHAPELLE SUR ERDRE",
         ];
 
-        test_file(path, titulaire);
+        test_file(path, account_holder);
     }
 
     #[test]
     fn addr_credit_mutuel_2() {
         let path = "tests/fixtures/rib/credit_mutuel_2.txt";
-        let titulaire = vec![
+        let account_holder = vec![
             "M OU MME MATISSE HENRI",
             "54 RUE DE L HERONNIERE",
             "44000 NANTES",
         ];
 
-        test_file(path, titulaire);
+        test_file(path, account_holder);
     }
 }

@@ -10,7 +10,7 @@ use crate::{
     ocrs::{extract_anchors, image_to_string_using_ocrs, ocrs_anchors},
     rib::{extract_fr_bic, extract_iban, Rib},
     tesseract::{img_to_string_using_tesseract, tess_analyze},
-    text::simple_titulaire::find_simple_titulaire,
+    text::simple_account_holder::find_simple_account_holder,
 };
 
 const OPTIMAL_TESSERACT_HEIGHT: u32 = 30;
@@ -35,8 +35,8 @@ pub fn zoom_and_extract(img: &DynamicImage, name: &str) -> Option<Rib> {
     if let Some(iban) = extract_iban(&ocrs_text) {
         trace!("early returns from ocrs for: {}", name);
         let bic = extract_fr_bic(&ocrs_text);
-        let titulaire = zoom_and_extract_titulaire(img, text_lines, name);
-        return Some(Rib::from_iban(iban, titulaire, bic));
+        let account_holder = zoom_and_extract_account_holder(img, text_lines, name);
+        return Some(Rib::from_iban(iban, account_holder, bic));
     };
 
     if let Some(anchor) = maybe_anchor {
@@ -46,18 +46,18 @@ pub fn zoom_and_extract(img: &DynamicImage, name: &str) -> Option<Rib> {
         let iban = extract_iban_in_image(&iban_image, name);
 
         if let Some(iban) = iban {
-            let titulaire = zoom_and_extract_titulaire(img, text_lines.clone(), name);
+            let account_holder = zoom_and_extract_account_holder(img, text_lines.clone(), name);
             let bic = extract_fr_bic(&ocrs_text);
-            rib = Some(Rib::from_iban(iban, titulaire, bic));
+            rib = Some(Rib::from_iban(iban, account_holder, bic));
         } else {
             // maybe this is a long iban with some | between words
             let iban_image = crop(img, anchor.narrow_iban_mask(), name, "narrow_mask");
             let iban = extract_iban_in_image(&iban_image, name);
 
             if let Some(iban) = iban {
-                let titulaire = zoom_and_extract_titulaire(img, text_lines, name);
+                let account_holder = zoom_and_extract_account_holder(img, text_lines, name);
                 let bic = extract_fr_bic(&ocrs_text);
-                rib = Some(Rib::from_iban(iban, titulaire, bic));
+                rib = Some(Rib::from_iban(iban, account_holder, bic));
             }
         }
     }
@@ -88,20 +88,20 @@ pub fn zoom_and_extract(img: &DynamicImage, name: &str) -> Option<Rib> {
         let iban = extract_iban_in_image(&iban_image, name);
         if let Some(iban) = iban {
             let (ocrs_text, text_lines, _) = ocrs_anchors(&img, &iban_regex, None);
-            let titulaire = zoom_and_extract_titulaire(&img, text_lines, name);
+            let account_holder = zoom_and_extract_account_holder(&img, text_lines, name);
             let bic = extract_fr_bic(&ocrs_text);
-            rib = Some(Rib::from_iban(iban, titulaire, bic));
+            rib = Some(Rib::from_iban(iban, account_holder, bic));
         }
     }
 
     rib
 }
 
-fn zoom_and_extract_titulaire(
+fn zoom_and_extract_account_holder(
     img: &DynamicImage,
     text_lines: Vec<TextLine>,
     name: &str,
-) -> Option<Vec<String>> {
+) -> Option<String> {
     let code_postal_line_regex = Regex::new(r"[[:space:]]*\d{5}\s+[[:alpha:]]").unwrap();
     let code_postal_word_regex = Regex::new(r"^\d{5}").unwrap();
 
@@ -136,7 +136,7 @@ fn zoom_and_extract_titulaire(
         Some(&code_postal_line_regex),
     );
 
-    let titulaires = postal_anchors
+    let account_holders = postal_anchors
         .iter()
         .enumerate()
         .map(|(index, anchor)| {
@@ -182,31 +182,32 @@ fn zoom_and_extract_titulaire(
         })
         .collect::<Vec<String>>();
 
-    let titulaire = titulaires
+    let account_holder = account_holders
         .first()
         .map(|s| s.lines().map(|l| l.to_string()).collect());
 
-    if titulaire.is_some() {
-        return titulaire;
+    if account_holder.is_some() {
+        return account_holder;
     }
 
-    let titulaire_word_regex = Regex::new(r"(?i)titulaire").unwrap();
-    let (_, _text_lines, titulaire_anchors) = ocrs_anchors(img, &titulaire_word_regex, None);
+    let account_holder_word_regex = Regex::new(r"(?i)titulaire").unwrap();
+    let (_, _text_lines, account_holder_anchors) =
+        ocrs_anchors(img, &account_holder_word_regex, None);
 
-    titulaire_anchors
+    account_holder_anchors
         .iter()
         .enumerate()
         .map(|(index, anchor)| {
             let cropped_img = crop(
                 img,
-                anchor.titulaire_mask(),
+                anchor.account_holder_mask(),
                 name,
-                &format!(r#"{}_titulaire_mask"#, index),
+                &format!(r#"{}_account_holder_mask"#, index),
             );
             image_to_string_using_ocrs(cropped_img)
         })
-        .filter(|text| titulaire_word_regex.is_match(text))
-        .find_map(|text| find_simple_titulaire(&text, 1))
+        .filter(|text| account_holder_word_regex.is_match(text))
+        .find_map(|text| find_simple_account_holder(&text, 1))
 }
 
 fn crop(

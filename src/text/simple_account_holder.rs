@@ -2,14 +2,14 @@ use regex::Regex;
 
 use super::patch::{right_complete, Patch};
 
-pub fn find_simple_titulaire(text: &str, nb_line: usize) -> Option<Vec<String>> {
-    let titulaire = Regex::new(r"(?i)(titulaire)").unwrap();
+pub fn find_simple_account_holder(text: &str, nb_line: usize) -> Option<String> {
+    let account_holder = Regex::new(r"(?i)(titulaire)").unwrap();
     let stop = Regex::new(r"(?i)(domiciliation|cadre réservé|identification)").unwrap();
     let lines: Vec<&str> = text.lines().collect();
 
     let result = if let Some((index, m)) = lines.iter().enumerate().find_map(|(i, line)| {
-        if titulaire.is_match(line) {
-            Some((i, titulaire.find(line).unwrap()))
+        if account_holder.is_match(line) {
+            Some((i, account_holder.find(line).unwrap()))
         } else {
             None
         }
@@ -24,7 +24,7 @@ pub fn find_simple_titulaire(text: &str, nb_line: usize) -> Option<Vec<String>> 
     };
 
     if result.is_some() {
-        return result;
+        return result.map(|r| r.join("\n"));
     }
 
     // last chance, try for one line by civilite
@@ -37,14 +37,14 @@ pub fn find_simple_titulaire(text: &str, nb_line: usize) -> Option<Vec<String>> 
         let start = m.start();
 
         return right_complete(lines[index], start, m.end() - 1)
-            .map(|end| vec![lines[index][start..=end].trim().to_string()]);
+            .map(|end| lines[index][start..=end].trim().to_string());
     }
 
     None
 }
 
 fn clean(lines: Vec<String>) -> Option<Vec<String>> {
-    let titulaire = Regex::new(r"(?i)(titulaire)").unwrap();
+    let account_holder = Regex::new(r"(?i)(titulaire)").unwrap();
     let headers =
         Regex::new(r"(?i)(titulaire|domiciliation|cadre réservé|identification|numero de)")
             .unwrap();
@@ -52,7 +52,7 @@ fn clean(lines: Vec<String>) -> Option<Vec<String>> {
     let vec: Vec<String> = lines
         .into_iter()
         .map(|line| {
-            if titulaire.is_match(&line) && line.contains(':') {
+            if account_holder.is_match(&line) && line.contains(':') {
                 line.split(':').nth(1).unwrap().to_string()
             } else {
                 line
