@@ -182,9 +182,12 @@ fn zoom_and_extract_account_holder(
         })
         .collect::<Vec<String>>();
 
-    let account_holder = account_holders
-        .first()
-        .map(|s| s.lines().map(|l| l.to_string()).collect());
+    let account_holder = account_holders.first().map(|s| {
+        s.lines()
+            .map(|l| l.to_string())
+            .collect::<Vec<String>>()
+            .join("\n")
+    });
 
     if account_holder.is_some() {
         return account_holder;
