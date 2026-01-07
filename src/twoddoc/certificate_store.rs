@@ -8,7 +8,7 @@ use x509_cert::{
 use crate::twoddoc::trust_service::trust_service;
 
 static TEST_CERTIFICATE: &[u8] =
-    include_bytes!("../../tests/fixtures/certificates/certificate_FR00_00.pem");
+    include_bytes!("../resources/certificates/certificate_FR00_00.pem");
 
 pub fn certificate(autorite_certification: &str, identifiant_du_certificat: &str) -> Certificate {
     if autorite_certification == "FR00" {

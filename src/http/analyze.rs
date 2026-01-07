@@ -1,8 +1,9 @@
+use actix_multipart::form::{tempfile::TempFile, text::Text, MultipartForm};
 use actix_web::{http::header::ContentType, post, web, HttpResponse, Responder};
 use reqwest::Response;
 use serde::{Deserialize, Serialize};
 
-use crate::analysis::{Analysis, Hint};
+use crate::analysis::{Analysis, Hint, Type};
 
 const MAX_FILE_SIZE: usize = 10 * 1024 * 1024;
 
@@ -10,6 +11,13 @@ const MAX_FILE_SIZE: usize = 10 * 1024 * 1024;
 struct RequestedFile {
     url: String,
     hint: Option<Hint>,
+}
+
+#[derive(Debug, MultipartForm)]
+struct UploadForm {
+    #[multipart(limit = "10MB")]
+    file: TempFile,
+    hint: Option<Text<String>>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -38,6 +46,47 @@ pub async fn analyze(requested_file: web::Json<RequestedFile>) -> impl Responder
     } else {
         handle_error(response).await
     }
+}
+
+#[post("/analyze/upload")]
+pub async fn analyze_upload(MultipartForm(form): MultipartForm<UploadForm>) -> impl Responder {
+    let mut filename = String::from("uploaded_file");
+    if let Some(fname) = &form.file.file_name {
+        filename = fname.to_string();
+    }
+
+    let file_size = form.file.size;
+
+    if file_size == 0 {
+        return HttpResponse::BadRequest().json(AnalysisError {
+            upstream_body: None,
+            upstream_status_code: None,
+            body: Some("No file provided".to_string()),
+        });
+    }
+
+    let file_bytes = match std::fs::read(form.file.file.path()) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            log::error!("Failed to read uploaded file: {}", e);
+            return HttpResponse::InternalServerError().json(AnalysisError {
+                upstream_body: None,
+                upstream_status_code: None,
+                body: Some("Failed to read uploaded file".to_string()),
+            });
+        }
+    };
+
+    let hint = form.hint.as_ref().and_then(|h| {
+        let h_lower = h.to_lowercase();
+        match h_lower.as_str() {
+            "rib" => Some(Hint::Type(Type::Rib)),
+            "2ddoc" => Some(Hint::Type(Type::Twoddoc)),
+            _ => None,
+        }
+    });
+
+    process_bytes(file_bytes, hint, &filename)
 }
 
 async fn handle_error(resp: Response) -> HttpResponse {
@@ -113,7 +162,21 @@ async fn handle_response(mut resp: Response, hint: Option<Hint>) -> HttpResponse
             });
     }
 
-    match Analysis::try_from((bytes, hint, "remote_file")) {
+    process_bytes(bytes, hint, "remote_file")
+}
+
+fn process_bytes(bytes: Vec<u8>, hint: Option<Hint>, name: &str) -> HttpResponse {
+    if bytes.len() > MAX_FILE_SIZE {
+        return HttpResponse::UnprocessableEntity()
+            .content_type(ContentType::json())
+            .json(AnalysisError {
+                upstream_status_code: None,
+                upstream_body: None,
+                body: Some("File too big".to_string()),
+            });
+    }
+
+    match Analysis::try_from((bytes, hint, name)) {
         Ok(analysis) => HttpResponse::Ok()
             .content_type(ContentType::json())
             .json(analysis),
