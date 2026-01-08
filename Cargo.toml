@@ -12,6 +12,7 @@ build = "build.rs"
 
 [dependencies]
 actix-web = "*"
+actix-multipart = "*"
 rxing = "*"
 nom = "*"
 chrono = { version = "*", features = ["serde"] }
@@ -43,6 +44,7 @@ rten = "*"
 assert_cmd = "*"
 static_init = "*"
 serial_test = "*"
+reqwest = { version = "*", features = ["multipart"] }
 
 [package.metadata.deb]
 depends = "poppler-utils, tesseract-ocr, tesseract-ocr-fra"

@@ -128,3 +128,104 @@ fn empty_pdf() {
         "Failed to extract text from PDF".to_string()
     );
 }
+
+#[test]
+fn multipart_upload_with_2ddoc() {
+    let file_path = "tests/fixtures/2ddoc/justificatif_de_domicile.png";
+    let file_content = std::fs::read(file_path).unwrap();
+
+    let form = reqwest::blocking::multipart::Form::new()
+        .part(
+            "file",
+            reqwest::blocking::multipart::Part::bytes(file_content)
+                .file_name("justificatif_de_domicile.png")
+                .mime_str("image/png")
+                .unwrap(),
+        )
+        .text("hint", "2ddoc");
+
+    let response = Client::new()
+        .post("http://localhost:8080/analyze/upload")
+        .multipart(form)
+        .send()
+        .unwrap();
+
+    assert_eq!(response.status().as_u16(), 200);
+
+    if let Analysis::Ddoc { ddoc } = response.json().unwrap() {
+        assert_eq!(
+            ddoc.unwrap().entete.autorite_certification,
+            "FR00".to_string()
+        );
+    } else {
+        panic!("Expected Analysis::Ddoc");
+    }
+}
+
+#[test]
+fn multipart_upload_file_too_big() {
+    let desired_size_mb = 12;
+    let size_bytes = desired_size_mb * 1024 * 1024;
+
+    let file_content = vec![0u8; size_bytes];
+
+    let form = reqwest::blocking::multipart::Form::new()
+        .part(
+            "file",
+            reqwest::blocking::multipart::Part::bytes(file_content)
+                .file_name("large")
+                .mime_str("image/png")
+                .unwrap(),
+        )
+        .text("hint", "2ddoc");
+
+    let response = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .unwrap()
+        .post("http://localhost:8080/analyze/upload")
+        .multipart(form)
+        .send()
+        .unwrap();
+
+    assert_eq!(response.status().as_u16(), 400);
+    assert_eq!(response.text().unwrap(), "Payload error");
+}
+
+#[test]
+fn multipart_missing_file() {
+    let form = reqwest::blocking::multipart::Form::new().text("hint", "rib");
+
+    let response = Client::new()
+        .post("http://localhost:8080/analyze/upload")
+        .multipart(form)
+        .send()
+        .unwrap();
+
+    assert_eq!(response.status().as_u16(), 400);
+    assert_eq!(response.text().unwrap(), "Required field is missing: file");
+}
+
+#[test]
+fn multipart_upload_empty_file() {
+    let form = reqwest::blocking::multipart::Form::new()
+        .part(
+            "file",
+            reqwest::blocking::multipart::Part::bytes(vec![])
+                .file_name("empty.txt")
+                .mime_str("text/plain")
+                .unwrap(),
+        )
+        .text("hint", "rib");
+
+    let response = Client::new()
+        .post("http://localhost:8080/analyze/upload")
+        .multipart(form)
+        .send()
+        .unwrap();
+
+    assert_eq!(response.status().as_u16(), 400);
+
+    let analysis: AnalysisError = response.json().unwrap();
+    assert_eq!(analysis.body.unwrap(), "No file provided".to_string());
+}

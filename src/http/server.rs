@@ -16,6 +16,7 @@ pub async fn main() -> std::io::Result<()> {
         App::new()
             .wrap(Logger::new(r#"{"timestamp":"%t","method":"%r","status":%s,"response_time":%D,"remote_addr":"%a","user_agent":"%{User-Agent}i","remote_file":"%{X-Remote-File}i"}"#))
             .service(analyze::analyze)
+            .service(analyze::analyze_upload)
             .service(ping::ping)
             .service(version::version)
     })
