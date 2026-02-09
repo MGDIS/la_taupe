@@ -1,4 +1,4 @@
-use actix_multipart::form::{tempfile::TempFile, text::Text, MultipartForm};
+use actix_multipart::form::{bytes::Bytes, text::Text, MultipartForm};
 use actix_web::{http::header::ContentType, post, web, HttpResponse, Responder};
 use reqwest::Response;
 use serde::{Deserialize, Serialize};
@@ -16,7 +16,7 @@ struct RequestedFile {
 #[derive(Debug, MultipartForm)]
 struct UploadForm {
     #[multipart(limit = "10MB")]
-    file: TempFile,
+    file: Bytes,
     hint: Option<Text<String>>,
 }
 
@@ -55,27 +55,15 @@ pub async fn analyze_upload(MultipartForm(form): MultipartForm<UploadForm>) -> i
         filename = fname.to_string();
     }
 
-    let file_size = form.file.size;
+    let file_bytes = form.file.data.to_vec();
 
-    if file_size == 0 {
+    if file_bytes.is_empty() {
         return HttpResponse::BadRequest().json(AnalysisError {
             upstream_body: None,
             upstream_status_code: None,
             body: Some("No file provided".to_string()),
         });
     }
-
-    let file_bytes = match std::fs::read(form.file.file.path()) {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            log::error!("Failed to read uploaded file: {}", e);
-            return HttpResponse::InternalServerError().json(AnalysisError {
-                upstream_body: None,
-                upstream_status_code: None,
-                body: Some("Failed to read uploaded file".to_string()),
-            });
-        }
-    };
 
     let hint = form.hint.as_ref().and_then(|h| {
         let h_lower = h.to_lowercase();
