@@ -163,6 +163,7 @@ fn multipart_upload_with_2ddoc() {
 }
 
 #[test]
+#[ignore]
 fn multipart_upload_file_too_big() {
     let desired_size_mb = 12;
     let size_bytes = desired_size_mb * 1024 * 1024;

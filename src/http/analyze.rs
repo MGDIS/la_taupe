@@ -55,15 +55,25 @@ pub async fn analyze_upload(MultipartForm(form): MultipartForm<UploadForm>) -> i
         filename = fname.to_string();
     }
 
-    let file_bytes = form.file.data.to_vec();
-
-    if file_bytes.is_empty() {
+    if form.file.data.is_empty() {
         return HttpResponse::BadRequest().json(AnalysisError {
             upstream_body: None,
             upstream_status_code: None,
             body: Some("No file provided".to_string()),
         });
     }
+
+    if form.file.data.len() > MAX_FILE_SIZE {
+        return HttpResponse::UnprocessableEntity()
+            .content_type(ContentType::json())
+            .json(AnalysisError {
+                upstream_status_code: None,
+                upstream_body: None,
+                body: Some("File too big".to_string()),
+            });
+    }
+
+    let file_bytes = form.file.data.to_vec();
 
     let hint = form.hint.as_ref().and_then(|h| {
         let h_lower = h.to_lowercase();
