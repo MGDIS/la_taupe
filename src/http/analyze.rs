@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::analysis::{Analysis, Hint, Type};
 
-const MAX_FILE_SIZE: usize = 10 * 1024 * 1024;
+pub const MAX_FILE_SIZE: usize = 10 * 1024 * 1024;
 
 #[derive(Deserialize)]
 struct RequestedFile {
@@ -15,7 +15,6 @@ struct RequestedFile {
 
 #[derive(Debug, MultipartForm)]
 struct UploadForm {
-    #[multipart(limit = "10MB")]
     file: Bytes,
     hint: Option<Text<String>>,
 }
@@ -61,16 +60,6 @@ pub async fn analyze_upload(MultipartForm(form): MultipartForm<UploadForm>) -> i
             upstream_status_code: None,
             body: Some("No file provided".to_string()),
         });
-    }
-
-    if form.file.data.len() > MAX_FILE_SIZE {
-        return HttpResponse::UnprocessableEntity()
-            .content_type(ContentType::json())
-            .json(AnalysisError {
-                upstream_status_code: None,
-                upstream_body: None,
-                body: Some("File too big".to_string()),
-            });
     }
 
     let file_bytes = form.file.data.to_vec();
@@ -164,16 +153,6 @@ async fn handle_response(mut resp: Response, hint: Option<Hint>) -> HttpResponse
 }
 
 fn process_bytes(bytes: Vec<u8>, hint: Option<Hint>, name: &str) -> HttpResponse {
-    if bytes.len() > MAX_FILE_SIZE {
-        return HttpResponse::UnprocessableEntity()
-            .content_type(ContentType::json())
-            .json(AnalysisError {
-                upstream_status_code: None,
-                upstream_body: None,
-                body: Some("File too big".to_string()),
-            });
-    }
-
     match Analysis::try_from((bytes, hint, name)) {
         Ok(analysis) => HttpResponse::Ok()
             .content_type(ContentType::json())

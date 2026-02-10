@@ -1,10 +1,15 @@
 use std::env;
 
 use super::{analyze, ping, version};
-use actix_web::{middleware::Logger, App, HttpServer};
+use actix_multipart::form::MultipartFormConfig;
+use actix_multipart::MultipartError;
+use actix_web::http::header::ContentType;
+use actix_web::{middleware::Logger, App, HttpResponse, HttpServer};
 use env_logger::Env;
 use std::io::Write;
 use std::net::{SocketAddr, ToSocketAddrs};
+
+use crate::http::analyze::{AnalysisError, MAX_FILE_SIZE};
 
 #[actix_web::main]
 pub async fn main() -> std::io::Result<()> {
@@ -13,7 +18,25 @@ pub async fn main() -> std::io::Result<()> {
         .init();
 
     HttpServer::new(|| {
+        let multipart_config = MultipartFormConfig::default()
+            .total_limit(MAX_FILE_SIZE)
+            .memory_limit(MAX_FILE_SIZE)
+            .error_handler(|err, _req| {
+                if let MultipartError::Payload(_) = &err {
+                    let response = HttpResponse::UnprocessableEntity()
+                        .content_type(ContentType::json())
+                        .json(AnalysisError {
+                            upstream_status_code: None,
+                            upstream_body: None,
+                            body: Some("File too big".to_string()),
+                        });
+                    return actix_web::error::InternalError::from_response(err, response).into();
+                }
+                err.into()
+            });
+
         App::new()
+            .app_data(multipart_config)
             .wrap(Logger::new(r#"{"timestamp":"%t","method":"%r","status":%s,"response_time":%D,"remote_addr":"%a","user_agent":"%{User-Agent}i","remote_file":"%{X-Remote-File}i"}"#))
             .service(analyze::analyze)
             .service(analyze::analyze_upload)

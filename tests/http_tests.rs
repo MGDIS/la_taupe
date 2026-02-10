@@ -163,7 +163,6 @@ fn multipart_upload_with_2ddoc() {
 }
 
 #[test]
-#[ignore]
 fn multipart_upload_file_too_big() {
     let desired_size_mb = 12;
     let size_bytes = desired_size_mb * 1024 * 1024;
@@ -189,8 +188,10 @@ fn multipart_upload_file_too_big() {
         .send()
         .unwrap();
 
-    assert_eq!(response.status().as_u16(), 400);
-    assert_eq!(response.text().unwrap(), "Payload error");
+    assert_eq!(response.status().as_u16(), 422);
+
+    let analysis: AnalysisError = response.json().unwrap();
+    assert_eq!(analysis.body.unwrap(), "File too big".to_string());
 }
 
 #[test]
