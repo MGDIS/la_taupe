@@ -37,7 +37,7 @@ pub async fn main() -> std::io::Result<()> {
 
         App::new()
             .app_data(multipart_config)
-            .wrap(Logger::new(r#"{"timestamp":"%t","method":"%r","status":%s,"response_time":%D,"remote_addr":"%a","user_agent":"%{User-Agent}i","remote_file":"%{X-Remote-File}i"}"#))
+            .wrap(Logger::new(r#"{"timestamp":"%t","method":"%r","status":%s,"response_time":%D,"remote_addr":"%a","user_agent":"%{User-Agent}i","referer":"%{Referer}i","remote_file":"%{X-Remote-File}i"}"#))
             .service(analyze::analyze)
             .service(analyze::analyze_upload)
             .service(ping::ping)
