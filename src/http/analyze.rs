@@ -1,11 +1,11 @@
-use actix_multipart::form::{tempfile::TempFile, text::Text, MultipartForm};
+use actix_multipart::form::{bytes::Bytes, text::Text, MultipartForm};
 use actix_web::{http::header::ContentType, post, web, HttpResponse, Responder};
 use reqwest::Response;
 use serde::{Deserialize, Serialize};
 
 use crate::analysis::{Analysis, Hint, Type};
 
-const MAX_FILE_SIZE: usize = 10 * 1024 * 1024;
+pub const MAX_FILE_SIZE: usize = 10 * 1024 * 1024;
 
 #[derive(Deserialize)]
 struct RequestedFile {
@@ -15,8 +15,7 @@ struct RequestedFile {
 
 #[derive(Debug, MultipartForm)]
 struct UploadForm {
-    #[multipart(limit = "10MB")]
-    file: TempFile,
+    file: Bytes,
     hint: Option<Text<String>>,
 }
 
@@ -55,9 +54,7 @@ pub async fn analyze_upload(MultipartForm(form): MultipartForm<UploadForm>) -> i
         filename = fname.to_string();
     }
 
-    let file_size = form.file.size;
-
-    if file_size == 0 {
+    if form.file.data.is_empty() {
         return HttpResponse::BadRequest().json(AnalysisError {
             upstream_body: None,
             upstream_status_code: None,
@@ -65,17 +62,7 @@ pub async fn analyze_upload(MultipartForm(form): MultipartForm<UploadForm>) -> i
         });
     }
 
-    let file_bytes = match std::fs::read(form.file.file.path()) {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            log::error!("Failed to read uploaded file: {}", e);
-            return HttpResponse::InternalServerError().json(AnalysisError {
-                upstream_body: None,
-                upstream_status_code: None,
-                body: Some("Failed to read uploaded file".to_string()),
-            });
-        }
-    };
+    let file_bytes = form.file.data.to_vec();
 
     let hint = form.hint.as_ref().and_then(|h| {
         let h_lower = h.to_lowercase();
@@ -166,16 +153,6 @@ async fn handle_response(mut resp: Response, hint: Option<Hint>) -> HttpResponse
 }
 
 fn process_bytes(bytes: Vec<u8>, hint: Option<Hint>, name: &str) -> HttpResponse {
-    if bytes.len() > MAX_FILE_SIZE {
-        return HttpResponse::UnprocessableEntity()
-            .content_type(ContentType::json())
-            .json(AnalysisError {
-                upstream_status_code: None,
-                upstream_body: None,
-                body: Some("File too big".to_string()),
-            });
-    }
-
     match Analysis::try_from((bytes, hint, name)) {
         Ok(analysis) => HttpResponse::Ok()
             .content_type(ContentType::json())

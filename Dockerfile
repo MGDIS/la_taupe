@@ -1,6 +1,6 @@
 # Multi-stage build for La Taupe
 # Stage 1: Builder - Compile the Rust application
-FROM rust:1.92-bookworm AS builder
+FROM rust:1.93-bookworm AS builder
 
 RUN apt-get update && apt-get install -y \
     pkg-config \
