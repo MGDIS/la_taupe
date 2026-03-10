@@ -56,7 +56,4 @@ EXPOSE 8080
 ENV RUST_LOG=info
 ENV LA_TAUPE_ADDRESS=0.0.0.0:8080
 
-HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:8080/ping || exit 1
-
 CMD ["la_taupe"]
