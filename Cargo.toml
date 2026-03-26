@@ -39,6 +39,7 @@ reqwest = { version = "*", features = ["json", "blocking"] }
 url = "*"
 ocrs = "*"
 rten = "*"
+leptess = "0.14.0"
 
 [dev-dependencies]
 assert_cmd = "*"
