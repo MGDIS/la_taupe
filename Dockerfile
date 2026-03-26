@@ -5,6 +5,9 @@ FROM rust:1.93-bookworm AS builder
 RUN apt-get update && apt-get install -y \
     pkg-config \
     libssl-dev \
+    libtesseract-dev \
+    libleptonica-dev \
+    libclang-dev \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
