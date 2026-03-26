@@ -20,8 +20,7 @@ pub fn img_to_string_using_tesseract(img: DynamicImage) -> String {
         .expect("Failed to set PSM");
     lt.set_variable(Variable::PreserveInterwordSpaces, "1")
         .expect("Failed to set preserve_interword_spaces");
-    lt.set_image_from_mem(&bytes)
-        .expect("Failed to load image");
+    lt.set_image_from_mem(&bytes).expect("Failed to load image");
 
     lt.get_utf8_text().expect("Failed to get text from LepTess")
 }
@@ -48,8 +47,7 @@ fn image_to_hocr(img: &DynamicImage) -> (String, Html) {
         .expect("Failed to set PSM");
     lt.set_variable(Variable::PreserveInterwordSpaces, "1")
         .expect("Failed to set preserve_interword_spaces");
-    lt.set_image_from_mem(&bytes)
-        .expect("Failed to load image");
+    lt.set_image_from_mem(&bytes).expect("Failed to load image");
 
     let hocr = lt
         .get_hocr_text(0)
