@@ -5,6 +5,7 @@ use std::{
 
 use image::{DynamicImage, ImageFormat};
 use itertools::Itertools;
+use leptess::{LepTess, Variable};
 use regex::Regex;
 use scraper::{ElementRef, Html, Selector};
 
@@ -15,33 +16,17 @@ pub fn img_to_string_using_tesseract(img: DynamicImage) -> String {
 
     let mut buffer = Cursor::new(Vec::new());
     img.write_to(&mut buffer, ImageFormat::Png).unwrap();
-    let vec = buffer.into_inner();
+    let bytes = buffer.into_inner();
 
-    let mut child = Command::new("tesseract")
-        .args([
-            "--psm",
-            "12",
-            "-c",
-            "preserve_interword_spaces=1",
-            "-l",
-            "fra",
-            "-",
-            "-",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("Failed to start tesseract");
+    let mut lt = LepTess::new(None, "fra").expect("Failed to initialize LepTess");
+    lt.set_variable(Variable::TesseditPagesegMode, "12")
+        .expect("Failed to set PSM");
+    lt.set_variable(Variable::PreserveInterwordSpaces, "1")
+        .expect("Failed to set preserve_interword_spaces");
+    lt.set_image_from_mem(&bytes)
+        .expect("Failed to load image");
 
-    let mut stdin = child.stdin.take().expect("Failed to open stdin");
-    std::thread::spawn(move || {
-        stdin.write_all(&vec).expect("Failed to write to stdin");
-    });
-
-    let output = child.wait_with_output().expect("Failed to wait on child");
-
-    String::from_utf8_lossy(&output.stdout).to_string()
+    lt.get_utf8_text().expect("Failed to get text from LepTess")
 }
 
 pub fn tess_analyze(img: &DynamicImage) -> (String, Option<f32>, Option<Anchor>) {
