@@ -55,7 +55,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y poppler-utils libtesseract-dev libleptonica-dev libclang-dev
+          sudo apt-get install -y poppler-utils libtesseract-dev libleptonica-dev libclang-dev tesseract-ocr-fra
 
       - name: Enable Corepack
         run: corepack enable
@@ -65,6 +65,9 @@ jobs:
 
       - name: Install Node Dependencies
         run: yarn install --cwd tests/fixtures/static_server
+
+      - name: Download OCRS models
+        run: bash download-models.sh
 
       - run: cargo test --all-features
 

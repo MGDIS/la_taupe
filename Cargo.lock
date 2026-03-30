@@ -2121,6 +2121,7 @@ dependencies = [
  "serial_test",
  "static_init",
  "tempfile",
+ "tokio",
  "tree_magic_mini",
  "url",
  "x509-cert",

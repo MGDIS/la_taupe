@@ -1,32 +1,18 @@
-use std::io::Cursor;
-
-use image::{DynamicImage, ImageFormat};
 use itertools::Itertools;
-use leptess::{LepTess, Variable};
+use leptess::LepTess;
 use regex::Regex;
 use scraper::{ElementRef, Html, Selector};
 
 use crate::shapes::{Anchor, Point};
 
-pub fn img_to_string_using_tesseract(img: DynamicImage) -> String {
-    let img = increase_image_size_if_needed(img);
-
-    let mut buffer = Cursor::new(Vec::new());
-    img.write_to(&mut buffer, ImageFormat::Png).unwrap();
-    let bytes = buffer.into_inner();
-
-    let mut lt = LepTess::new(None, "fra").expect("Failed to initialize LepTess");
-    lt.set_variable(Variable::TesseditPagesegMode, "12")
-        .expect("Failed to set PSM");
-    lt.set_variable(Variable::PreserveInterwordSpaces, "1")
-        .expect("Failed to set preserve_interword_spaces");
-    lt.set_image_from_mem(&bytes).expect("Failed to load image");
-
+pub fn img_to_string_using_tesseract(lt: &mut LepTess, png_bytes: &[u8]) -> String {
+    lt.set_image_from_mem(png_bytes)
+        .expect("Failed to load image");
     lt.get_utf8_text().expect("Failed to get text from LepTess")
 }
 
-pub fn tess_analyze(img: &DynamicImage) -> (String, Option<f32>, Option<Anchor>) {
-    let (hocr, doc) = image_to_hocr(img);
+pub fn tess_analyze(lt: &mut LepTess, png_bytes: &[u8]) -> (String, Option<f32>, Option<Anchor>) {
+    let (hocr, doc) = image_to_hocr(lt, png_bytes);
     let (mut angle, mut anchor) = (None, None);
 
     if let Some(el) = iban_el(&doc) {
@@ -37,17 +23,9 @@ pub fn tess_analyze(img: &DynamicImage) -> (String, Option<f32>, Option<Anchor>)
     (hocr, angle, anchor)
 }
 
-fn image_to_hocr(img: &DynamicImage) -> (String, Html) {
-    let mut buffer = Cursor::new(Vec::new());
-    img.write_to(&mut buffer, ImageFormat::Png).unwrap();
-    let bytes = buffer.into_inner();
-
-    let mut lt = LepTess::new(None, "fra").expect("Failed to initialize LepTess");
-    lt.set_variable(Variable::TesseditPagesegMode, "12")
-        .expect("Failed to set PSM");
-    lt.set_variable(Variable::PreserveInterwordSpaces, "1")
-        .expect("Failed to set preserve_interword_spaces");
-    lt.set_image_from_mem(&bytes).expect("Failed to load image");
+fn image_to_hocr(lt: &mut LepTess, png_bytes: &[u8]) -> (String, Html) {
+    lt.set_image_from_mem(png_bytes)
+        .expect("Failed to load image");
 
     let hocr = lt
         .get_hocr_text(0)
@@ -134,18 +112,4 @@ fn to_anchor(iban_anchor: &ElementRef) -> Option<Anchor> {
     } else {
         None
     }
-}
-
-fn increase_image_size_if_needed(img: DynamicImage) -> DynamicImage {
-    // si la largeur ou la hauteur est inférieur a 500 on multiply par 2
-    if img.width() >= 500 && img.height() >= 500 {
-        return img;
-    }
-
-    // increase * 2 if the image is too small
-    img.resize(
-        img.width() * 2,
-        img.height() * 2,
-        image::imageops::FilterType::Lanczos3,
-    )
 }

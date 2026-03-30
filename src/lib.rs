@@ -1,4 +1,5 @@
 pub mod analysis;
+pub mod config;
 pub mod datamatrix;
 pub mod fi_extract;
 pub mod file_utils;
@@ -6,6 +7,7 @@ pub mod http;
 pub mod image_utils;
 pub mod ocr;
 pub mod ocrs;
+pub mod pool;
 pub mod rib;
 pub mod shapes;
 pub mod tesseract;

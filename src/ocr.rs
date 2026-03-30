@@ -1,8 +1,9 @@
 use std::io::Cursor;
 
-use image::{DynamicImage, ImageDecoder, ImageReader};
+use image::{DynamicImage, ImageDecoder, ImageFormat, ImageReader};
+use leptess::LepTess;
 use log::trace;
-use ocrs::TextLine;
+use ocrs::{OcrEngine, TextLine};
 use regex::Regex;
 
 use crate::{
@@ -15,27 +16,54 @@ use crate::{
 
 const OPTIMAL_TESSERACT_HEIGHT: u32 = 30;
 
-pub fn image_bytes_to_rib(content: Vec<u8>, name: &str) -> Option<Rib> {
+fn encode_png(img: &DynamicImage) -> Vec<u8> {
+    let mut buffer = Cursor::new(Vec::new());
+    img.write_to(&mut buffer, ImageFormat::Png).unwrap();
+    buffer.into_inner()
+}
+
+fn increase_image_size_if_needed(img: DynamicImage) -> DynamicImage {
+    if img.width() >= 500 && img.height() >= 500 {
+        return img;
+    }
+    img.resize(
+        img.width() * 2,
+        img.height() * 2,
+        image::imageops::FilterType::Lanczos3,
+    )
+}
+
+pub fn image_bytes_to_rib(
+    lt: &mut LepTess,
+    engine: &OcrEngine,
+    content: Vec<u8>,
+    name: &str,
+) -> Option<Rib> {
     let img = bytes_to_img(content)?;
     save_image_in_debug(&img, name, "");
 
-    zoom_and_extract(&img, name).or_else(|| {
+    zoom_and_extract(lt, engine, &img, name).or_else(|| {
         let cleaned_img = clean_image(&img, name);
-        zoom_and_extract(&cleaned_img, name)
+        zoom_and_extract(lt, engine, &cleaned_img, name)
     })
 }
 
-pub fn zoom_and_extract(img: &DynamicImage, name: &str) -> Option<Rib> {
+pub fn zoom_and_extract(
+    lt: &mut LepTess,
+    engine: &OcrEngine,
+    img: &DynamicImage,
+    name: &str,
+) -> Option<Rib> {
     let mut rib = None;
     let iban_regex = Regex::new(r"(?:^|\s)FR[\dO]").unwrap();
 
-    let (ocrs_text, text_lines, maybe_anchors) = ocrs_anchors(img, &iban_regex, None);
+    let (ocrs_text, text_lines, maybe_anchors) = ocrs_anchors(engine, img, &iban_regex, None);
     let maybe_anchor = maybe_anchors.first();
 
     if let Some(iban) = extract_iban(&ocrs_text) {
         trace!("early returns from ocrs for: {}", name);
         let bic = extract_fr_bic(&ocrs_text);
-        let account_holder = zoom_and_extract_account_holder(img, text_lines, name);
+        let account_holder = zoom_and_extract_account_holder(engine, img, text_lines, name);
         return Some(Rib::from_iban(iban, account_holder, bic));
     };
 
@@ -43,19 +71,20 @@ pub fn zoom_and_extract(img: &DynamicImage, name: &str) -> Option<Rib> {
         trace!("ocrs anchor found");
 
         let iban_image = crop(img, anchor.iban_mask(), name, "mask");
-        let iban = extract_iban_in_image(&iban_image, name);
+        let iban = extract_iban_in_image(lt, engine, &iban_image, name);
 
         if let Some(iban) = iban {
-            let account_holder = zoom_and_extract_account_holder(img, text_lines.clone(), name);
+            let account_holder =
+                zoom_and_extract_account_holder(engine, img, text_lines.clone(), name);
             let bic = extract_fr_bic(&ocrs_text);
             rib = Some(Rib::from_iban(iban, account_holder, bic));
         } else {
             // maybe this is a long iban with some | between words
             let iban_image = crop(img, anchor.narrow_iban_mask(), name, "narrow_mask");
-            let iban = extract_iban_in_image(&iban_image, name);
+            let iban = extract_iban_in_image(lt, engine, &iban_image, name);
 
             if let Some(iban) = iban {
-                let account_holder = zoom_and_extract_account_holder(img, text_lines, name);
+                let account_holder = zoom_and_extract_account_holder(engine, img, text_lines, name);
                 let bic = extract_fr_bic(&ocrs_text);
                 rib = Some(Rib::from_iban(iban, account_holder, bic));
             }
@@ -66,12 +95,12 @@ pub fn zoom_and_extract(img: &DynamicImage, name: &str) -> Option<Rib> {
         return rib;
     }
 
-    let (_hocr_string, maybe_angle, maybe_anchor) = tess_analyze(img);
+    let (_hocr_string, maybe_angle, maybe_anchor) = tess_analyze(lt, &encode_png(img));
 
     let (img, maybe_anchor) = maybe_angle
         .map(|angle| {
             let rotated_img = rotate(img, angle);
-            let (_, _, new_anchor) = tess_analyze(&rotated_img);
+            let (_, _, new_anchor) = tess_analyze(lt, &encode_png(&rotated_img));
             (rotated_img, new_anchor)
         })
         .unwrap_or((img.clone(), maybe_anchor));
@@ -85,10 +114,10 @@ pub fn zoom_and_extract(img: &DynamicImage, name: &str) -> Option<Rib> {
         let iban_image = resize(&iban_image, anchor.height, OPTIMAL_TESSERACT_HEIGHT);
         save_image_in_debug(&iban_image, name, "rotated_resized_mask");
 
-        let iban = extract_iban_in_image(&iban_image, name);
+        let iban = extract_iban_in_image(lt, engine, &iban_image, name);
         if let Some(iban) = iban {
-            let (ocrs_text, text_lines, _) = ocrs_anchors(&img, &iban_regex, None);
-            let account_holder = zoom_and_extract_account_holder(&img, text_lines, name);
+            let (ocrs_text, text_lines, _) = ocrs_anchors(engine, &img, &iban_regex, None);
+            let account_holder = zoom_and_extract_account_holder(engine, &img, text_lines, name);
             let bic = extract_fr_bic(&ocrs_text);
             rib = Some(Rib::from_iban(iban, account_holder, bic));
         }
@@ -98,6 +127,7 @@ pub fn zoom_and_extract(img: &DynamicImage, name: &str) -> Option<Rib> {
 }
 
 fn zoom_and_extract_account_holder(
+    engine: &OcrEngine,
     img: &DynamicImage,
     text_lines: Vec<TextLine>,
     name: &str,
@@ -146,7 +176,11 @@ fn zoom_and_extract_account_holder(
                 name,
                 &format!(r#"{}_addr_mask"#, index),
             );
-            (index, image_to_string_using_ocrs(cropped_img), anchor)
+            (
+                index,
+                image_to_string_using_ocrs(engine, cropped_img),
+                anchor,
+            )
         })
         .filter_map(|(index, text, anchor)| {
             if match_civilite(&text) {
@@ -158,7 +192,7 @@ fn zoom_and_extract_account_holder(
                     name,
                     &format!(r#"{}_right_align_addr_mask"#, index),
                 );
-                let new_text = image_to_string_using_ocrs(cropped_img);
+                let new_text = image_to_string_using_ocrs(engine, cropped_img);
 
                 if match_civilite(&new_text) {
                     Some(new_text)
@@ -195,7 +229,7 @@ fn zoom_and_extract_account_holder(
 
     let account_holder_word_regex = Regex::new(r"(?i)titulaire").unwrap();
     let (_, _text_lines, account_holder_anchors) =
-        ocrs_anchors(img, &account_holder_word_regex, None);
+        ocrs_anchors(engine, img, &account_holder_word_regex, None);
 
     account_holder_anchors
         .iter()
@@ -207,7 +241,7 @@ fn zoom_and_extract_account_holder(
                 name,
                 &format!(r#"{}_account_holder_mask"#, index),
             );
-            image_to_string_using_ocrs(cropped_img)
+            image_to_string_using_ocrs(engine, cropped_img)
         })
         .filter(|text| account_holder_word_regex.is_match(text))
         .find_map(|text| find_simple_account_holder(&text, 1))
@@ -237,13 +271,20 @@ fn bytes_to_img(content: Vec<u8>) -> Option<DynamicImage> {
     Some(img.into_luma8().into())
 }
 
-fn extract_iban_in_image(cropped_img: &DynamicImage, name: &str) -> Option<String> {
-    let tess_iban = img_to_string_using_tesseract(cropped_img.clone());
+fn extract_iban_in_image(
+    lt: &mut LepTess,
+    engine: &OcrEngine,
+    cropped_img: &DynamicImage,
+    name: &str,
+) -> Option<String> {
+    let cropped_img = increase_image_size_if_needed(cropped_img.clone());
+    let png_bytes = encode_png(&cropped_img);
+    let tess_iban = img_to_string_using_tesseract(lt, &png_bytes);
     if let Some(iban) = extract_iban(&tess_iban) {
         return Some(iban);
     };
 
-    let ocrs_iban = image_to_string_using_ocrs(cropped_img.clone());
+    let ocrs_iban = image_to_string_using_ocrs(engine, cropped_img);
     if let Some(iban) = extract_iban(&ocrs_iban) {
         return Some(iban);
     };
