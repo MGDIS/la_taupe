@@ -3,8 +3,8 @@ use ocrs::{OcrEngine, OcrEngineParams};
 use rten::Model;
 use tokio::sync::mpsc;
 
-const DETECTION_MODEL: &[u8] = include_bytes!("../models/text-detection.rten");
-const RECOGNITION_MODEL: &[u8] = include_bytes!("../models/text-recognition.rten");
+pub const DETECTION_MODEL: &[u8] = include_bytes!("../models/text-detection.rten");
+pub const RECOGNITION_MODEL: &[u8] = include_bytes!("../models/text-recognition.rten");
 
 // --- LepTess Pool ---
 

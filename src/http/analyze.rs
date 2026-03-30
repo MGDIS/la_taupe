@@ -135,8 +135,9 @@ async fn process_with_concurrency_control(
                     }),
             }
         }
-        Ok(Err(_)) => {
+        Ok(Err(e)) => {
             // web::block panic — instances lost, replenish pools
+            log::error!("OCR processing panicked: {:?}", e);
             leptess_pool.replenish().await;
             ocr_engine_pool.replenish().await;
             HttpResponse::InternalServerError().json(AnalysisError {
@@ -148,6 +149,7 @@ async fn process_with_concurrency_control(
         Err(_) => {
             // Timeout — blocking thread still running, instances will be dropped when it finishes
             // Replenish with new instances
+            log::warn!("OCR processing timed out after {}s", state.ocr_timeout_secs);
             leptess_pool.replenish().await;
             ocr_engine_pool.replenish().await;
             HttpResponse::ServiceUnavailable().json(AnalysisError {

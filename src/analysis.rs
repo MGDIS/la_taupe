@@ -137,12 +137,9 @@ impl TryFrom<(&Path, Option<Hint>)> for Analysis {
         lt.set_variable(leptess::Variable::PreserveInterwordSpaces, "1")
             .unwrap();
 
-        let detection_model =
-            rten::Model::load_static_slice(include_bytes!("../models/text-detection.rten"))
-                .unwrap();
+        let detection_model = rten::Model::load_static_slice(crate::pool::DETECTION_MODEL).unwrap();
         let recognition_model =
-            rten::Model::load_static_slice(include_bytes!("../models/text-recognition.rten"))
-                .unwrap();
+            rten::Model::load_static_slice(crate::pool::RECOGNITION_MODEL).unwrap();
         let engine = OcrEngine::new(ocrs::OcrEngineParams {
             detection_model: Some(detection_model),
             recognition_model: Some(recognition_model),
