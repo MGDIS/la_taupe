@@ -7,16 +7,26 @@ use crate::shapes::{Anchor, Point};
 pub fn image_to_string_using_ocrs(engine: &OcrEngine, img: DynamicImage) -> String {
     let img = img.into_rgb8();
 
+    // Apply standard image pre-processing expected by this library (convert
+    // to greyscale, map range to [-0.5, 0.5]).
     let img_source = ImageSource::from_bytes(img.as_raw(), img.dimensions()).unwrap();
     let ocr_input = engine.prepare_input(img_source).unwrap();
 
+    // Get oriented bounding boxes of text words in input image.
     let word_rects = engine.detect_words(&ocr_input).unwrap();
+
+    // Group words into lines. Each line is represented by a list of word
+    // bounding boxes.
     let line_rects = engine.find_text_lines(&ocr_input, &word_rects);
+
+    // Recognize the characters in each line.
     let line_texts = engine.recognize_text(&ocr_input, &line_rects).unwrap();
 
     line_texts
         .iter()
         .flatten()
+        // Filter likely spurious detections. With future model improvements
+        // this should become unnecessary.
         .filter(|l| l.to_string().len() > 1)
         .map(|l| l.to_string())
         .collect::<Vec<String>>()
@@ -31,12 +41,19 @@ pub fn ocrs_anchors(
 ) -> (String, Vec<TextLine>, Vec<Anchor>) {
     let img = img.clone().into_rgb8();
 
+    // Apply standard image pre-processing expected by this library (convert
+    // to greyscale, map range to [-0.5, 0.5]).
     let img_source = ImageSource::from_bytes(img.as_raw(), img.dimensions()).unwrap();
     let ocr_input = engine.prepare_input(img_source).unwrap();
 
+    // Get oriented bounding boxes of text words in input image.
     let word_rects = engine.detect_words(&ocr_input).unwrap();
+
+    // Group words into lines. Each line is represented by a list of word
+    // bounding boxes.
     let line_rects = engine.find_text_lines(&ocr_input, &word_rects);
 
+    // Recognize the characters in each line.
     let text_lines = engine
         .recognize_text(&ocr_input, &line_rects)
         .unwrap()
@@ -47,6 +64,8 @@ pub fn ocrs_anchors(
 
     let text = text_lines
         .iter()
+        // Filter likely spurious detections. With future model improvements
+        // this should become unnecessary.
         .filter(|l| l.to_string().len() > 1)
         .map(|l| l.to_string())
         .collect::<Vec<String>>()
