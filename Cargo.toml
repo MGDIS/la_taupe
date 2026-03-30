@@ -39,7 +39,7 @@ reqwest = { version = "*", features = ["json", "blocking"] }
 url = "*"
 ocrs = "*"
 rten = "*"
-leptess = "0.14.0"
+leptess = "*"
 tokio = { version = "*", features = ["sync", "time", "rt"] }
 
 [dev-dependencies]
