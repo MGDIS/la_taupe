@@ -231,3 +231,43 @@ fn multipart_upload_empty_file() {
     let analysis: AnalysisError = response.json().unwrap();
     assert_eq!(analysis.body.unwrap(), "No file provided".to_string());
 }
+
+#[test]
+fn ocr_timeout_returns_503() {
+    use assert_cmd::prelude::*;
+    use std::process::Command;
+
+    let mut server = Command::cargo_bin("la_taupe")
+        .unwrap()
+        .env("LA_TAUPE_ADDRESS", "127.0.0.1:8099")
+        .env("LA_TAUPE_OCR_TIMEOUT_SECS", "0")
+        .spawn()
+        .expect("failed to start la_taupe with timeout=0");
+
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    let file_content = std::fs::read("tests/fixtures/2ddoc/justificatif_de_domicile.png").unwrap();
+
+    let form = reqwest::blocking::multipart::Form::new()
+        .part(
+            "file",
+            reqwest::blocking::multipart::Part::bytes(file_content)
+                .file_name("test.png")
+                .mime_str("image/png")
+                .unwrap(),
+        )
+        .text("hint", "rib");
+
+    let response = Client::new()
+        .post("http://localhost:8099/analyze/upload")
+        .multipart(form)
+        .send()
+        .unwrap();
+
+    assert_eq!(response.status().as_u16(), 503);
+
+    let analysis: AnalysisError = response.json().unwrap();
+    assert_eq!(analysis.body.unwrap(), "OCR processing timeout".to_string());
+
+    server.kill().expect("failed to kill timeout test server");
+}
