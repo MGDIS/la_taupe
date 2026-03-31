@@ -1,31 +1,11 @@
 use image::DynamicImage;
-use ocrs::{ImageSource, OcrEngine, OcrEngineParams, TextItem, TextLine};
+use ocrs::{ImageSource, OcrEngine, TextItem, TextLine};
 use regex::Regex;
-use rten::Model;
 
 use crate::shapes::{Anchor, Point};
 
-const DETECTION_MODEL: &[u8] = include_bytes!("../models/text-detection.rten");
-const RECOGNITION_MODEL: &[u8] = include_bytes!("../models/text-recognition.rten");
-
-pub fn image_to_string_using_ocrs(img: DynamicImage) -> String {
+pub fn image_to_string_using_ocrs(engine: &OcrEngine, img: DynamicImage) -> String {
     let img = img.into_rgb8();
-
-    #[allow(clippy::const_is_empty)]
-    if DETECTION_MODEL.is_empty() || RECOGNITION_MODEL.is_empty() {
-        panic!("--> ocrs models are empty in models/ directory. Please run `download_models.sh` to download the models.");
-    }
-
-    // 10 ms to load the models
-    let detection_model = Model::load_static_slice(DETECTION_MODEL).unwrap();
-    let recognition_model = Model::load_static_slice(RECOGNITION_MODEL).unwrap();
-
-    let engine = OcrEngine::new(OcrEngineParams {
-        detection_model: Some(detection_model),
-        recognition_model: Some(recognition_model),
-        ..Default::default()
-    })
-    .unwrap();
 
     // Apply standard image pre-processing expected by this library (convert
     // to greyscale, map range to [-0.5, 0.5]).
@@ -54,27 +34,12 @@ pub fn image_to_string_using_ocrs(img: DynamicImage) -> String {
 }
 
 pub fn ocrs_anchors(
+    engine: &OcrEngine,
     img: &DynamicImage,
     word_regex: &Regex,
     line_regex: Option<&Regex>,
 ) -> (String, Vec<TextLine>, Vec<Anchor>) {
     let img = img.clone().into_rgb8();
-
-    #[allow(clippy::const_is_empty)]
-    if DETECTION_MODEL.is_empty() || RECOGNITION_MODEL.is_empty() {
-        panic!("--> ocrs models are empty in models/ directory. Please run `download_models.sh` to download the models.");
-    }
-
-    // 10 ms to load the models
-    let detection_model = Model::load_static_slice(DETECTION_MODEL).unwrap();
-    let recognition_model = Model::load_static_slice(RECOGNITION_MODEL).unwrap();
-
-    let engine = OcrEngine::new(OcrEngineParams {
-        detection_model: Some(detection_model),
-        recognition_model: Some(recognition_model),
-        ..Default::default()
-    })
-    .unwrap();
 
     // Apply standard image pre-processing expected by this library (convert
     // to greyscale, map range to [-0.5, 0.5]).

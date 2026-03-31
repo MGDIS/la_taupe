@@ -1,5 +1,7 @@
 use std::path::Path;
 
+use leptess::LepTess;
+use ocrs::OcrEngine;
 use serde::{Deserialize, Serialize};
 
 use crate::file_utils::{list_img_in_pdf, pdf_to_img_bytes};
@@ -43,7 +45,12 @@ pub enum Type {
     Twoddoc,
 }
 
-fn vec_to_rib(content: Vec<u8>, name: &str) -> Result<Option<Rib>, String> {
+fn vec_to_rib(
+    content: Vec<u8>,
+    name: &str,
+    lt: &mut LepTess,
+    engine: &OcrEngine,
+) -> Result<Option<Rib>, String> {
     let filetype = tree_magic_mini::from_u8(&content);
 
     if filetype == "application/pdf" {
@@ -58,16 +65,16 @@ fn vec_to_rib(content: Vec<u8>, name: &str) -> Result<Option<Rib>, String> {
             // don't try it for all as it is costly
             } else if list_img_in_pdf(content.clone()) == 1 {
                 let img = pdf_to_img_bytes(content);
-                Ok(image_bytes_to_rib(img, name))
+                Ok(image_bytes_to_rib(lt, engine, img, name))
             } else {
                 Ok(None)
             }
         } else {
             let img = pdf_to_img_bytes(content);
-            Ok(image_bytes_to_rib(img, name))
+            Ok(image_bytes_to_rib(lt, engine, img, name))
         }
     } else if filetype == "image/png" || filetype == "image/jpeg" {
-        Ok(image_bytes_to_rib(content, name))
+        Ok(image_bytes_to_rib(lt, engine, content, name))
     } else if filetype == "text/plain" {
         let string_rib = String::from_utf8(content)
             .map_err(|_| "Failed to convert bytes to string".to_string())?;
@@ -87,25 +94,26 @@ fn vec_to_ddoc(content: Vec<u8>) -> Result<Option<Ddoc>, String> {
     }
 }
 
-impl TryFrom<(Vec<u8>, Option<Hint>, &str)> for Analysis {
-    type Error = String;
-
-    fn try_from((content, hint, name): (Vec<u8>, Option<Hint>, &str)) -> Result<Self, String> {
+impl Analysis {
+    pub fn analyze(
+        content: Vec<u8>,
+        hint: Option<Hint>,
+        name: &str,
+        lt: &mut LepTess,
+        engine: &OcrEngine,
+    ) -> Result<Self, String> {
         match hint {
             Some(Hint::Type(Type::Rib)) => {
-                let rib = vec_to_rib(content, name)?;
-
+                let rib = vec_to_rib(content, name, lt, engine)?;
                 Ok(Analysis::Rib { rib })
             }
             Some(Hint::Type(Type::Twoddoc)) => {
                 let ddoc = vec_to_ddoc(content)?;
-
                 Ok(Analysis::Ddoc { ddoc })
             }
             None => {
-                let rib = vec_to_rib(content.clone(), name).unwrap_or(None);
+                let rib = vec_to_rib(content.clone(), name, lt, engine).unwrap_or(None);
                 let ddoc = vec_to_ddoc(content).unwrap_or(None);
-
                 Ok(Analysis::DdocAndRib { ddoc, rib })
             }
         }
@@ -122,6 +130,23 @@ impl TryFrom<(&Path, Option<Hint>)> for Analysis {
             .unwrap_or("unknown");
         let content =
             std::fs::read(file_path).map_err(|e| format!("Failed to read file: {}", e))?;
-        Analysis::try_from((content, hint, base_name))
+
+        let mut lt = LepTess::new(None, "fra").expect("Failed to initialize LepTess");
+        lt.set_variable(leptess::Variable::TesseditPagesegMode, "12")
+            .unwrap();
+        lt.set_variable(leptess::Variable::PreserveInterwordSpaces, "1")
+            .unwrap();
+
+        let detection_model = rten::Model::load_static_slice(crate::pool::DETECTION_MODEL).unwrap();
+        let recognition_model =
+            rten::Model::load_static_slice(crate::pool::RECOGNITION_MODEL).unwrap();
+        let engine = OcrEngine::new(ocrs::OcrEngineParams {
+            detection_model: Some(detection_model),
+            recognition_model: Some(recognition_model),
+            ..Default::default()
+        })
+        .unwrap();
+
+        Analysis::analyze(content, hint, base_name, &mut lt, &engine)
     }
 }

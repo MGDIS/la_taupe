@@ -1,51 +1,18 @@
-use std::{
-    io::{Cursor, Write},
-    process::{Command, Stdio},
-};
-
-use image::{DynamicImage, ImageFormat};
 use itertools::Itertools;
+use leptess::LepTess;
 use regex::Regex;
 use scraper::{ElementRef, Html, Selector};
 
 use crate::shapes::{Anchor, Point};
 
-pub fn img_to_string_using_tesseract(img: DynamicImage) -> String {
-    let img = increase_image_size_if_needed(img);
-
-    let mut buffer = Cursor::new(Vec::new());
-    img.write_to(&mut buffer, ImageFormat::Png).unwrap();
-    let vec = buffer.into_inner();
-
-    let mut child = Command::new("tesseract")
-        .args([
-            "--psm",
-            "12",
-            "-c",
-            "preserve_interword_spaces=1",
-            "-l",
-            "fra",
-            "-",
-            "-",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("Failed to start tesseract");
-
-    let mut stdin = child.stdin.take().expect("Failed to open stdin");
-    std::thread::spawn(move || {
-        stdin.write_all(&vec).expect("Failed to write to stdin");
-    });
-
-    let output = child.wait_with_output().expect("Failed to wait on child");
-
-    String::from_utf8_lossy(&output.stdout).to_string()
+pub fn img_to_string_using_tesseract(lt: &mut LepTess, png_bytes: &[u8]) -> String {
+    lt.set_image_from_mem(png_bytes)
+        .expect("Failed to load image");
+    lt.get_utf8_text().expect("Failed to get text from LepTess")
 }
 
-pub fn tess_analyze(img: &DynamicImage) -> (String, Option<f32>, Option<Anchor>) {
-    let (hocr, doc) = image_to_hocr(img);
+pub fn tess_analyze(lt: &mut LepTess, png_bytes: &[u8]) -> (String, Option<f32>, Option<Anchor>) {
+    let (hocr, doc) = image_to_hocr(lt, png_bytes);
     let (mut angle, mut anchor) = (None, None);
 
     if let Some(el) = iban_el(&doc) {
@@ -56,37 +23,13 @@ pub fn tess_analyze(img: &DynamicImage) -> (String, Option<f32>, Option<Anchor>)
     (hocr, angle, anchor)
 }
 
-fn image_to_hocr(img: &DynamicImage) -> (String, Html) {
-    let mut buffer = Cursor::new(Vec::new());
-    img.write_to(&mut buffer, ImageFormat::Png).unwrap();
-    let vec = buffer.into_inner();
+fn image_to_hocr(lt: &mut LepTess, png_bytes: &[u8]) -> (String, Html) {
+    lt.set_image_from_mem(png_bytes)
+        .expect("Failed to load image");
 
-    let mut child = Command::new("tesseract")
-        .args([
-            "--psm",
-            "12",
-            "-c",
-            "preserve_interword_spaces=1",
-            "-l",
-            "fra",
-            "-",
-            "-",
-            "hocr",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("Failed to start tesseract");
-
-    let mut stdin = child.stdin.take().expect("Failed to open stdin");
-    std::thread::spawn(move || {
-        stdin.write_all(&vec).expect("Failed to write to stdin");
-    });
-
-    let output = child.wait_with_output().expect("Failed to wait on child");
-
-    let hocr = String::from_utf8_lossy(&output.stdout).to_string();
+    let hocr = lt
+        .get_hocr_text(0)
+        .expect("Failed to get hOCR from LepTess");
 
     let doc = Html::parse_document(&hocr);
 
@@ -169,18 +112,4 @@ fn to_anchor(iban_anchor: &ElementRef) -> Option<Anchor> {
     } else {
         None
     }
-}
-
-fn increase_image_size_if_needed(img: DynamicImage) -> DynamicImage {
-    // si la largeur ou la hauteur est inférieur a 500 on multiply par 2
-    if img.width() >= 500 && img.height() >= 500 {
-        return img;
-    }
-
-    // increase * 2 if the image is too small
-    img.resize(
-        img.width() * 2,
-        img.height() * 2,
-        image::imageops::FilterType::Lanczos3,
-    )
 }

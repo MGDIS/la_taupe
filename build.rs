@@ -29,7 +29,23 @@ fn fake_download_models() {
     let detection_model = models_dir.join("text-detection.rten");
     let recognition_model = models_dir.join("text-recognition.rten");
 
-    // on cree les fichiers models vides si les fichiers n'existent pas
+    // si les modeles existent et ne sont pas vides (deja telecharges), on ne les touche pas
+    let detection_ok = detection_model.exists()
+        && detection_model
+            .metadata()
+            .map(|m| m.len() > 0)
+            .unwrap_or(false);
+    let recognition_ok = recognition_model.exists()
+        && recognition_model
+            .metadata()
+            .map(|m| m.len() > 0)
+            .unwrap_or(false);
+
+    if detection_ok && recognition_ok {
+        return;
+    }
+
+    // sinon on cree des fichiers vides pour que include_bytes! compile
     if !detection_model.exists() {
         std::fs::File::create(&detection_model).expect("Failed to create detection model file");
     }

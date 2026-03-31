@@ -1,15 +1,26 @@
 use std::env;
+use std::sync::Arc;
 
 use super::{analyze, ping, version};
 use actix_multipart::form::MultipartFormConfig;
 use actix_multipart::MultipartError;
 use actix_web::http::header::ContentType;
-use actix_web::{middleware::Logger, App, HttpResponse, HttpServer};
+use actix_web::{middleware::Logger, web, App, HttpResponse, HttpServer};
 use env_logger::Env;
 use std::io::Write;
 use std::net::{SocketAddr, ToSocketAddrs};
+use tokio::sync::Semaphore;
 
+use crate::config::AppConfig;
 use crate::http::analyze::{AnalysisError, MAX_FILE_SIZE};
+use crate::pool::{LepTessPool, OcrEnginePool};
+
+pub struct AppState {
+    pub semaphore: Arc<Semaphore>,
+    pub leptess_pool: Arc<LepTessPool>,
+    pub ocr_engine_pool: Arc<OcrEnginePool>,
+    pub ocr_timeout_secs: u64,
+}
 
 #[actix_web::main]
 pub async fn main() -> std::io::Result<()> {
@@ -17,7 +28,16 @@ pub async fn main() -> std::io::Result<()> {
         .format(|buf, record| writeln!(buf, "{}", record.args()))
         .init();
 
-    HttpServer::new(|| {
+    let config = AppConfig::from_env();
+
+    let state = web::Data::new(AppState {
+        semaphore: Arc::new(Semaphore::new(config.max_concurrent_ocr)),
+        leptess_pool: Arc::new(LepTessPool::new(config.max_concurrent_ocr)),
+        ocr_engine_pool: Arc::new(OcrEnginePool::new(config.max_concurrent_ocr)),
+        ocr_timeout_secs: config.ocr_timeout_secs,
+    });
+
+    HttpServer::new(move || {
         let multipart_config = MultipartFormConfig::default()
             .total_limit(MAX_FILE_SIZE)
             .memory_limit(MAX_FILE_SIZE)
@@ -36,6 +56,7 @@ pub async fn main() -> std::io::Result<()> {
             });
 
         App::new()
+            .app_data(state.clone())
             .app_data(multipart_config)
             .wrap(Logger::new(r#"{"timestamp":"%t","method":"%r","status":%s,"response_time":%D,"remote_addr":"%a","user_agent":"%{User-Agent}i","referer":"%{Referer}i","remote_file":"%{X-Remote-File}i"}"#))
             .service(analyze::analyze)
@@ -43,6 +64,7 @@ pub async fn main() -> std::io::Result<()> {
             .service(ping::ping)
             .service(version::version)
     })
+    .workers(config.workers)
     .bind(binding_address())?
     .run()
     .await

@@ -2,7 +2,7 @@
 name = "la_taupe"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.86.0"
+rust-version = "1.94.0"
 license-file = "LICENSE.txt"
 description = "La Taupe is a tool to extract administrative data from documents."
 authors = ["See git log"]
@@ -39,6 +39,8 @@ reqwest = { version = "*", features = ["json", "blocking"] }
 url = "*"
 ocrs = "*"
 rten = "*"
+leptess = "*"
+tokio = { version = "*", features = ["sync", "time", "rt"] }
 
 [dev-dependencies]
 assert_cmd = "*"

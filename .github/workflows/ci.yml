@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v3
 
-      - uses: dtolnay/rust-toolchain@1.86.0
+      - uses: dtolnay/rust-toolchain@1.94.0
         with: { components: rustfmt }
 
       - run: cargo fmt --all -- --check
@@ -27,8 +27,13 @@ jobs:
     steps:
       - uses: actions/checkout@v3
 
-      - uses: dtolnay/rust-toolchain@1.86.0
+      - uses: dtolnay/rust-toolchain@1.94.0
         with: { components: clippy }
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libtesseract-dev libleptonica-dev libclang-dev
 
       - name: Cache Dependencies
         uses: Swatinem/rust-cache@v2
@@ -42,15 +47,15 @@ jobs:
     steps:
       - uses: actions/checkout@v3
 
-      - uses: dtolnay/rust-toolchain@1.86.0
+      - uses: dtolnay/rust-toolchain@1.94.0
 
       - name: Cache Dependencies
         uses: Swatinem/rust-cache@v2
 
-      - name: install poppler
+      - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y poppler-utils
+          sudo apt-get install -y poppler-utils libtesseract-dev libleptonica-dev libclang-dev tesseract-ocr-fra
 
       - name: Enable Corepack
         run: corepack enable
@@ -60,6 +65,9 @@ jobs:
 
       - name: Install Node Dependencies
         run: yarn install --cwd tests/fixtures/static_server
+
+      - name: Download OCRS models
+        run: bash download-models.sh
 
       - run: cargo test --all-features
 
