@@ -8,8 +8,6 @@ use tokio::time::timeout;
 use crate::analysis::{Analysis, Hint, Type};
 use crate::http::server::AppState;
 
-pub const MAX_FILE_SIZE: usize = 10 * 1024 * 1024;
-
 #[derive(Deserialize)]
 struct RequestedFile {
     url: String,
@@ -192,14 +190,16 @@ async fn handle_response(
     hint: Option<Hint>,
     state: web::Data<AppState>,
 ) -> HttpResponse {
+    let max_file_size = state.max_file_size;
+
     let len = resp
         .headers()
         .get("content-length")
         .and_then(|h| h.to_str().ok())
         .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(MAX_FILE_SIZE);
+        .unwrap_or(max_file_size);
 
-    if len > MAX_FILE_SIZE {
+    if len > max_file_size {
         return HttpResponse::UnprocessableEntity()
             .content_type(ContentType::json())
             .json(AnalysisError {
@@ -217,14 +217,14 @@ async fn handle_response(
             None => break,
         }
 
-        if bytes.len() > MAX_FILE_SIZE {
+        if bytes.len() > max_file_size {
             break;
         }
     }
 
     let size = bytes.len();
 
-    if size > MAX_FILE_SIZE {
+    if size > max_file_size {
         return HttpResponse::UnprocessableEntity()
             .content_type(ContentType::json())
             .json(AnalysisError {

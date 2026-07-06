@@ -12,7 +12,7 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use tokio::sync::Semaphore;
 
 use crate::config::AppConfig;
-use crate::http::analyze::{AnalysisError, MAX_FILE_SIZE};
+use crate::http::analyze::AnalysisError;
 use crate::pool::{LepTessPool, OcrEnginePool};
 
 pub struct AppState {
@@ -20,6 +20,7 @@ pub struct AppState {
     pub leptess_pool: Arc<LepTessPool>,
     pub ocr_engine_pool: Arc<OcrEnginePool>,
     pub ocr_timeout_secs: u64,
+    pub max_file_size: usize,
 }
 
 #[actix_web::main]
@@ -35,12 +36,15 @@ pub async fn main() -> std::io::Result<()> {
         leptess_pool: Arc::new(LepTessPool::new(config.max_concurrent_ocr)),
         ocr_engine_pool: Arc::new(OcrEnginePool::new(config.max_concurrent_ocr)),
         ocr_timeout_secs: config.ocr_timeout_secs,
+        max_file_size: config.max_file_size,
     });
+
+    let max_file_size = config.max_file_size;
 
     HttpServer::new(move || {
         let multipart_config = MultipartFormConfig::default()
-            .total_limit(MAX_FILE_SIZE)
-            .memory_limit(MAX_FILE_SIZE)
+            .total_limit(max_file_size)
+            .memory_limit(max_file_size)
             .error_handler(|err, _req| {
                 if let MultipartError::Payload(_) = &err {
                     let response = HttpResponse::UnprocessableEntity()
