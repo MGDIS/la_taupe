@@ -123,11 +123,11 @@ async fn process_with_concurrency_control(
             }),
         Ok(Err(e)) => {
             // panique dans web::block : l'instance Tesseract en cours est jetée par le pool
-            log::error!("OCR processing panicked: {:?}", e);
+            log::error!("analysis task failed: {}", e);
             HttpResponse::InternalServerError().json(AnalysisError {
                 upstream_body: None,
                 upstream_status_code: None,
-                body: Some("Internal processing error".to_string()),
+                body: Some("analysis task failed".to_string()),
             })
         }
         Err(_) => {

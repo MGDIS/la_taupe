@@ -23,7 +23,9 @@ jobs:
 
   clippy:
     name: clippy
-    runs-on: ubuntu-latest
+    # 24.04 : sur 26.04 (ubuntu-latest), leptonica-sys 0.4.9 (bindgen 0.64) ne genere
+    # plus ses bindings avec libclang 21 (`unknown type name 'atomic_int'`).
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v3
 
@@ -43,7 +45,9 @@ jobs:
 
   test:
     name: cargo test
-    runs-on: ubuntu-latest
+    # 24.04 : sur 26.04 (ubuntu-latest), leptonica-sys 0.4.9 (bindgen 0.64) ne genere
+    # plus ses bindings avec libclang 21 (`unknown type name 'atomic_int'`).
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v3
 
