@@ -1,18 +1,34 @@
+use std::io::Cursor;
+
+use image::{DynamicImage, ImageFormat};
 use itertools::Itertools;
-use leptess::LepTess;
 use regex::Regex;
 use scraper::{ElementRef, Html, Selector};
 
+use crate::pool::leptess;
 use crate::shapes::{Anchor, Point};
 
-pub fn img_to_string_using_tesseract(lt: &mut LepTess, png_bytes: &[u8]) -> String {
-    lt.set_image_from_mem(png_bytes)
-        .expect("Failed to load image");
+// Tesseract tourne in-process via leptess (libtesseract) : une instance du pool global
+// par appel, avec les réglages de l'ancien appel CLI (`--psm 12`,
+// `preserve_interword_spaces=1`, `-l fra`), fixés à la création de l'instance.
+
+pub fn img_to_string_using_tesseract(img: DynamicImage) -> String {
+    crate::timing::measure(crate::timing::tesseract, || {
+        img_to_string_using_tesseract_inner(img)
+    })
+}
+
+fn img_to_string_using_tesseract_inner(img: DynamicImage) -> String {
+    let img = increase_image_size_if_needed(img);
+    let png = encode_png(&img);
+
+    let mut lt = leptess();
+    lt.set_image_from_mem(&png).expect("Failed to load image");
     lt.get_utf8_text().expect("Failed to get text from LepTess")
 }
 
-pub fn tess_analyze(lt: &mut LepTess, png_bytes: &[u8]) -> (String, Option<f32>, Option<Anchor>) {
-    let (hocr, doc) = image_to_hocr(lt, png_bytes);
+pub fn tess_analyze(img: &DynamicImage) -> (String, Option<f32>, Option<Anchor>) {
+    let (hocr, doc) = crate::timing::measure(crate::timing::tesseract, || image_to_hocr(img));
     let (mut angle, mut anchor) = (None, None);
 
     if let Some(el) = iban_el(&doc) {
@@ -23,17 +39,25 @@ pub fn tess_analyze(lt: &mut LepTess, png_bytes: &[u8]) -> (String, Option<f32>,
     (hocr, angle, anchor)
 }
 
-fn image_to_hocr(lt: &mut LepTess, png_bytes: &[u8]) -> (String, Html) {
-    lt.set_image_from_mem(png_bytes)
-        .expect("Failed to load image");
+fn image_to_hocr(img: &DynamicImage) -> (String, Html) {
+    let png = encode_png(img);
 
-    let hocr = lt
-        .get_hocr_text(0)
-        .expect("Failed to get hOCR from LepTess");
+    let hocr = {
+        let mut lt = leptess();
+        lt.set_image_from_mem(&png).expect("Failed to load image");
+        lt.get_hocr_text(0)
+            .expect("Failed to get hOCR from LepTess")
+    };
 
     let doc = Html::parse_document(&hocr);
 
     (hocr, doc)
+}
+
+fn encode_png(img: &DynamicImage) -> Vec<u8> {
+    let mut buffer = Cursor::new(Vec::new());
+    img.write_to(&mut buffer, ImageFormat::Png).unwrap();
+    buffer.into_inner()
 }
 
 fn find_angle(hocr_string: &str, iban_anchor: ElementRef) -> Option<f32> {
@@ -112,4 +136,18 @@ fn to_anchor(iban_anchor: &ElementRef) -> Option<Anchor> {
     } else {
         None
     }
+}
+
+fn increase_image_size_if_needed(img: DynamicImage) -> DynamicImage {
+    // si la largeur ou la hauteur est inférieur a 500 on multiply par 2
+    if img.width() >= 500 && img.height() >= 500 {
+        return img;
+    }
+
+    // increase * 2 if the image is too small
+    img.resize(
+        img.width() * 2,
+        img.height() * 2,
+        image::imageops::FilterType::Lanczos3,
+    )
 }

@@ -100,56 +100,40 @@ async fn process_with_concurrency_control(
         }
     };
 
-    let mut lt = state.leptess_pool.acquire().await;
-    let engine = state.ocr_engine_pool.acquire().await;
-
+    // L'analyse dure de quelques secondes à plusieurs dizaines : la laisser dans le
+    // futur bloquerait un worker actix et toutes les connexions qu'il multiplexe.
+    // web::block la porte sur le pool de threads bloquants.
     let ocr_timeout = Duration::from_secs(state.ocr_timeout_secs);
-    let leptess_pool = state.leptess_pool.clone();
-    let ocr_engine_pool = state.ocr_engine_pool.clone();
-
     let result = timeout(
         ocr_timeout,
-        web::block(move || {
-            let analysis_result = Analysis::analyze(bytes, hint, &name, &mut lt, &engine);
-            (analysis_result, lt, engine)
-        }),
+        web::block(move || Analysis::try_from((bytes, hint, name.as_str()))),
     )
     .await;
 
     match result {
-        Ok(Ok((analysis_result, lt, engine))) => {
-            leptess_pool.release(lt).await;
-            ocr_engine_pool.release(engine).await;
-            match analysis_result {
-                Ok(analysis) => HttpResponse::Ok()
-                    .content_type(ContentType::json())
-                    .json(analysis),
-                Err(error_msg) => HttpResponse::UnprocessableEntity()
-                    .content_type(ContentType::json())
-                    .json(AnalysisError {
-                        upstream_status_code: None,
-                        upstream_body: None,
-                        body: Some(error_msg),
-                    }),
-            }
-        }
+        Ok(Ok(Ok(analysis))) => HttpResponse::Ok()
+            .content_type(ContentType::json())
+            .json(analysis),
+        Ok(Ok(Err(error_msg))) => HttpResponse::UnprocessableEntity()
+            .content_type(ContentType::json())
+            .json(AnalysisError {
+                upstream_status_code: None,
+                upstream_body: None,
+                body: Some(error_msg),
+            }),
         Ok(Err(e)) => {
-            // web::block panic — instances lost, replenish pools
-            log::error!("OCR processing panicked: {:?}", e);
-            leptess_pool.replenish().await;
-            ocr_engine_pool.replenish().await;
+            // panique dans web::block : l'instance Tesseract en cours est jetée par le pool
+            log::error!("analysis task failed: {}", e);
             HttpResponse::InternalServerError().json(AnalysisError {
                 upstream_body: None,
                 upstream_status_code: None,
-                body: Some("Internal processing error".to_string()),
+                body: Some("analysis task failed".to_string()),
             })
         }
         Err(_) => {
-            // Timeout — blocking thread still running, instances will be dropped when it finishes
-            // Replenish with new instances
+            // Timeout : le thread bloquant continue jusqu'au bout de l'analyse et rend
+            // ses instances au pool à chaque appel Tesseract terminé
             log::warn!("OCR processing timed out after {}s", state.ocr_timeout_secs);
-            leptess_pool.replenish().await;
-            ocr_engine_pool.replenish().await;
             HttpResponse::ServiceUnavailable().json(AnalysisError {
                 upstream_body: None,
                 upstream_status_code: None,

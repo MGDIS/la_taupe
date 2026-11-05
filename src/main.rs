@@ -1,10 +1,15 @@
 use la_taupe::{
-    analysis::{Analysis, Hint, Type},
+    analysis::{rib_analysis_traced, Analysis, Hint, Type},
     http::server,
+    text::holder_parts::split_holder,
     twoddoc::trust_service,
 };
 use serde_json::json;
-use std::{env::args, path::Path};
+use std::{
+    env::args,
+    path::{Path, PathBuf},
+    time::Instant,
+};
 
 fn main() {
     let args: Vec<String> = args().collect();
@@ -13,8 +18,21 @@ fn main() {
         println!("La taupe: a tool to analyze files");
         println!("--version to print the version");
         println!("--trusted-repositories-urls to print the trusted repository urls");
-        println!("la_taupe file_path to analyze a file");
+        println!("la_taupe [--type rib|2ddoc] [--jobs N] path... to analyze files or");
+        println!("        directories, one JSON line per file, with the analysis duration.");
+        println!("        --type restricts the analysis, like the hint of the http api;");
+        println!("        without it both analyses run.");
+        println!("        --trace (with --type rib) adds what the pipeline did: route, engine,");
+        println!("        candidate holder blocks with their place and outcome; never text.");
+        println!("la_taupe --split-holder reads holders on stdin, one per line with | between");
+        println!("        the lines of the block, and prints their name and address, one JSON");
+        println!("        line each: what the analysis does to the holder it reads.");
         println!("la_taupe to start the server");
+        std::process::exit(0);
+    }
+
+    if args.contains(&String::from("--split-holder")) {
+        split_holders();
         std::process::exit(0);
     }
 
@@ -35,26 +53,157 @@ fn main() {
         let _ = server::main();
     } else {
         env_logger::init();
-
-        let paths: Vec<&Path> = args[1..].iter().map(Path::new).collect();
-        paths.iter().for_each(|path| {
-            let result = Analysis::try_from((*path, Some(Hint::Type(Type::Rib))));
-            match result {
-                Ok(analysis_result) => {
-                    let json = json!({
-                        "file_path": path.to_str().unwrap(),
-                        "analysis": analysis_result
-                    });
-                    println!("{}", serde_json::to_string_pretty(&json).unwrap());
-                }
-                Err(msg) => {
-                    let json = json!({
-                        "file_path": path.to_str().unwrap(),
-                        "error": msg
-                    });
-                    println!("{}", serde_json::to_string_pretty(&json).unwrap());
-                }
-            }
-        });
+        analyze_batch(&args);
     }
+}
+
+/// Batch analysis: expands directories, analyzes `--jobs` files concurrently and
+/// prints one compact JSON line per file, so a driving script can stream the results.
+/// `--type` mirrors the hint of the http api; without it both analyses run.
+fn analyze_batch(args: &[String]) {
+    let mut hint: Option<Hint> = None;
+    let mut jobs = 1;
+    let mut trace = false;
+    let mut files: Vec<PathBuf> = Vec::new();
+
+    let mut iter = args[1..].iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--type" => match iter.next().map(String::as_str) {
+                Some("rib") => hint = Some(Hint::Type(Type::Rib)),
+                Some("2ddoc") => hint = Some(Hint::Type(Type::Twoddoc)),
+                other => {
+                    eprintln!(
+                        "--type expects rib or 2ddoc, got {}",
+                        other.unwrap_or("nothing")
+                    );
+                    std::process::exit(1);
+                }
+            },
+            "--trace" => trace = true,
+            "--jobs" => match iter.next().and_then(|value| value.parse::<usize>().ok()) {
+                Some(value) => jobs = value.max(1),
+                None => {
+                    eprintln!("--jobs expects a number");
+                    std::process::exit(1);
+                }
+            },
+            flag if flag.starts_with("--") => {
+                eprintln!("unknown flag {}", flag);
+                std::process::exit(1);
+            }
+            path => match expand(Path::new(path)) {
+                Ok(mut paths) => files.append(&mut paths),
+                Err(msg) => {
+                    eprintln!("{}", msg);
+                    std::process::exit(1);
+                }
+            },
+        }
+    }
+
+    if files.is_empty() {
+        eprintln!("expected at least one file or directory");
+        std::process::exit(1);
+    }
+
+    if trace && !matches!(hint, Some(Hint::Type(Type::Rib))) {
+        eprintln!("--trace requires --type rib");
+        std::process::exit(1);
+    }
+
+    let jobs = jobs.min(files.len());
+
+    std::thread::scope(|scope| {
+        for job in 0..jobs {
+            let files = &files;
+
+            scope.spawn(move || {
+                files.iter().skip(job).step_by(jobs).for_each(|path| {
+                    // println! locks stdout for the whole line: no interleaving
+                    println!("{}", analyze_one(path, hint, trace));
+                });
+            });
+        }
+    });
+}
+
+/// Name and address of holders given as text: the split applied to a known holder (an
+/// annotated truth), so that it can be measured apart from the reading.
+fn split_holders() {
+    for line in std::io::stdin().lines().map_while(Result::ok) {
+        let (name, address) = split_holder(&line.replace('|', "\n"));
+        println!("{}", json!({"name": name, "address": address}));
+    }
+}
+
+/// A RIB analysis, with the trace of what the pipeline did.
+fn traced(path: &Path) -> Result<(Analysis, la_taupe::provenance::Provenance), String> {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("unknown");
+    let content = std::fs::read(path).map_err(|e| format!("Failed to read file: {}", e))?;
+    rib_analysis_traced(content, name)
+}
+
+/// Files of a directory (hidden ones excluded), sorted so two runs list them in the
+/// same order; a plain file is returned as is.
+fn expand(path: &Path) -> Result<Vec<PathBuf>, String> {
+    if !path.is_dir() {
+        return Ok(vec![path.to_path_buf()]);
+    }
+
+    let entries =
+        std::fs::read_dir(path).map_err(|e| format!("cannot read {}: {}", path.display(), e))?;
+
+    let mut files: Vec<PathBuf> = entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| !name.starts_with('.'))
+                .unwrap_or(false)
+        })
+        .collect();
+
+    files.sort();
+
+    Ok(files)
+}
+
+/// One stubborn file must not sink a whole directory run: panics are caught and
+/// reported as an error line, like any other failure.
+fn analyze_one(path: &Path, hint: Option<Hint>, trace: bool) -> String {
+    let file_path = path.display().to_string();
+
+    let started = Instant::now();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if trace {
+            traced(path).map(|(analysis, provenance)| (analysis, Some(provenance.to_json())))
+        } else {
+            Analysis::try_from((path, hint)).map(|analysis| (analysis, None))
+        }
+    }));
+    let duration_ms = started.elapsed().as_millis() as u64;
+
+    let line = match outcome {
+        Ok(Ok((analysis, None))) => {
+            json!({"file_path": file_path, "duration_ms": duration_ms, "analysis": analysis})
+        }
+        Ok(Ok((analysis, Some(trace)))) => json!({
+            "file_path": file_path,
+            "duration_ms": duration_ms,
+            "analysis": analysis,
+            "trace": trace,
+        }),
+        Ok(Err(msg)) => json!({"file_path": file_path, "duration_ms": duration_ms, "error": msg}),
+        Err(_) => {
+            json!({"file_path": file_path, "duration_ms": duration_ms, "error": "analysis panicked"})
+        }
+    };
+
+    serde_json::to_string(&line).unwrap()
 }

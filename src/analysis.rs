@@ -1,15 +1,14 @@
 use std::path::Path;
 
-use leptess::LepTess;
-use ocrs::OcrEngine;
 use serde::{Deserialize, Serialize};
 
-use crate::file_utils::{list_img_in_pdf, pdf_to_img_bytes};
+use crate::file_utils::{largest_image_page, pdf_page_to_img_bytes, pdf_to_img_bytes};
+use crate::provenance::{Engine, Provenance, Route};
 use crate::rib::Rib;
 use crate::{
     datamatrix::fetch_datamatrix,
     file_utils::{bytes_to_img, pdf_bytes_to_string},
-    ocr::image_bytes_to_rib,
+    ocr::image_bytes_to_rib_traced,
     twoddoc::{ddoc::Ddoc, parse},
 };
 
@@ -23,7 +22,13 @@ pub enum Analysis {
         rib: Option<Rib>,
     },
     #[serde(rename = "rib")]
-    Rib { rib: Option<Rib> },
+    Rib {
+        rib: Option<Rib>,
+        /// Présent et vrai quand l'image ne contenait rien de lisible : distingue
+        /// « pas de RIB » de « rien à lire ». Absent du JSON dans tous les autres cas.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        unreadable: bool,
+    },
     #[serde(rename = "2ddoc")]
     Ddoc {
         #[serde(rename = "2ddoc")]
@@ -45,11 +50,16 @@ pub enum Type {
     Twoddoc,
 }
 
-fn vec_to_rib(
+fn vec_to_rib(content: Vec<u8>, name: &str) -> Result<Option<Rib>, String> {
+    vec_to_rib_traced(content, name, &mut Provenance::default())
+}
+
+/// Même aiguillage, en consignant la branche empruntée et la stratégie qui a abouti.
+/// Une seule implémentation, pour que la mesure porte sur le code de production.
+pub fn vec_to_rib_traced(
     content: Vec<u8>,
     name: &str,
-    lt: &mut LepTess,
-    engine: &OcrEngine,
+    provenance: &mut Provenance,
 ) -> Result<Option<Rib>, String> {
     let filetype = tree_magic_mini::from_u8(&content);
 
@@ -57,28 +67,51 @@ fn vec_to_rib(
         let string_rib = pdf_bytes_to_string(content.clone());
 
         if !string_rib.trim().is_empty() {
+            provenance.route = Some(Route::PdfText);
+
             let rib = Rib::parse(string_rib);
             if rib.is_some() {
+                provenance.engine = Some(Engine::PdfText);
                 Ok(rib)
-            // if there is only one image in PDF, it could be a scan of a RIB
-            // with some poorly parse text.
-            // don't try it for all as it is costly
-            } else if list_img_in_pdf(content.clone()) == 1 {
-                let img = pdf_to_img_bytes(content);
-                Ok(image_bytes_to_rib(lt, engine, img, name))
+            // Rien dans la couche texte : le RIB peut être une image — scan mal
+            // océrisé, RIB collé dans un bulletin d'adhésion ou une notice, à côté
+            // d'un logo, parfois pages plus loin — et on lit alors la page de la plus
+            // grande image. Sans image, la couche texte peut être illisible — polices
+            // sans table Unicode, texte vectorisé — et le RIB n'est visible qu'à l'œil :
+            // on lit la première page. Une seule page : c'est une OCR, donc coûteuse.
             } else {
-                Ok(None)
+                provenance.route = Some(Route::PdfImage);
+
+                let page = largest_image_page(content.clone()).unwrap_or(1);
+                provenance.page = Some(page);
+                let img = pdf_page_to_img_bytes(content, page);
+                Ok(image_bytes_to_rib_traced(img, name, provenance))
             }
         } else {
+            provenance.route = Some(Route::PdfImage);
+            provenance.page = Some(1);
+
             let img = pdf_to_img_bytes(content);
-            Ok(image_bytes_to_rib(lt, engine, img, name))
+            Ok(image_bytes_to_rib_traced(img, name, provenance))
         }
-    } else if filetype == "image/png" || filetype == "image/jpeg" {
-        Ok(image_bytes_to_rib(lt, engine, content, name))
+    // le TIFF : la sortie de certains scanners de bureau, décodé comme les autres
+    } else if matches!(filetype, "image/png" | "image/jpeg" | "image/tiff") {
+        provenance.route = Some(Route::Image);
+        provenance.page = Some(1);
+
+        Ok(image_bytes_to_rib_traced(content, name, provenance))
     } else if filetype == "text/plain" {
+        provenance.route = Some(Route::PlainText);
+
         let string_rib = String::from_utf8(content)
             .map_err(|_| "Failed to convert bytes to string".to_string())?;
-        Ok(Rib::parse(string_rib))
+
+        let rib = Rib::parse(string_rib);
+        if rib.is_some() {
+            provenance.engine = Some(Engine::PdfText);
+        }
+
+        Ok(rib)
     } else {
         Err(format!("Unsupported file type: {}", filetype))
     }
@@ -94,26 +127,34 @@ fn vec_to_ddoc(content: Vec<u8>) -> Result<Option<Ddoc>, String> {
     }
 }
 
-impl Analysis {
-    pub fn analyze(
-        content: Vec<u8>,
-        hint: Option<Hint>,
-        name: &str,
-        lt: &mut LepTess,
-        engine: &OcrEngine,
-    ) -> Result<Self, String> {
+/// Analyse d'un RIB, avec la trace de ce qu'elle a fait.
+pub fn rib_analysis_traced(content: Vec<u8>, name: &str) -> Result<(Analysis, Provenance), String> {
+    let mut provenance = Provenance::default();
+    let rib = vec_to_rib_traced(content, name, &mut provenance)?;
+    let unreadable = rib.is_none()
+        && provenance
+            .page_text_stats
+            .as_ref()
+            .is_some_and(|s| s.is_unreadable());
+
+    Ok((Analysis::Rib { rib, unreadable }, provenance))
+}
+
+impl TryFrom<(Vec<u8>, Option<Hint>, &str)> for Analysis {
+    type Error = String;
+
+    fn try_from((content, hint, name): (Vec<u8>, Option<Hint>, &str)) -> Result<Self, String> {
         match hint {
-            Some(Hint::Type(Type::Rib)) => {
-                let rib = vec_to_rib(content, name, lt, engine)?;
-                Ok(Analysis::Rib { rib })
-            }
+            Some(Hint::Type(Type::Rib)) => Ok(rib_analysis_traced(content, name)?.0),
             Some(Hint::Type(Type::Twoddoc)) => {
                 let ddoc = vec_to_ddoc(content)?;
+
                 Ok(Analysis::Ddoc { ddoc })
             }
             None => {
-                let rib = vec_to_rib(content.clone(), name, lt, engine).unwrap_or(None);
+                let rib = vec_to_rib(content.clone(), name).unwrap_or(None);
                 let ddoc = vec_to_ddoc(content).unwrap_or(None);
+
                 Ok(Analysis::DdocAndRib { ddoc, rib })
             }
         }
@@ -130,23 +171,85 @@ impl TryFrom<(&Path, Option<Hint>)> for Analysis {
             .unwrap_or("unknown");
         let content =
             std::fs::read(file_path).map_err(|e| format!("Failed to read file: {}", e))?;
+        Analysis::try_from((content, hint, base_name))
+    }
+}
 
-        let mut lt = LepTess::new(None, "fra").expect("Failed to initialize LepTess");
-        lt.set_variable(leptess::Variable::TesseditPagesegMode, "12")
-            .unwrap();
-        lt.set_variable(leptess::Variable::PreserveInterwordSpaces, "1")
-            .unwrap();
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-        let detection_model = rten::Model::load_static_slice(crate::pool::DETECTION_MODEL).unwrap();
-        let recognition_model =
-            rten::Model::load_static_slice(crate::pool::RECOGNITION_MODEL).unwrap();
-        let engine = OcrEngine::new(ocrs::OcrEngineParams {
-            detection_model: Some(detection_model),
-            recognition_model: Some(recognition_model),
-            ..Default::default()
+    /// Un PDF dont la couche texte existe mais n'est pas lisible — polices sans table
+    /// Unicode, texte vectorisé — et qui ne contient aucune image : le RIB n'est visible
+    /// qu'à l'œil. Sept PDF texte de la campagne de production échouaient ainsi, sans
+    /// OCR, en quelques dizaines de millisecondes. La fixture : un RIB fictif en tracés
+    /// vectoriels sous une couche de glyphes sans correspondance.
+    ///
+    /// Demande les modèles PP-OCR, absents de la CI :
+    ///     cargo test --release -- --ignored a_text_layer_without_a_rib
+    #[test]
+    #[ignore = "demande les modèles PP-OCR (download-models.sh)"]
+    fn a_text_layer_without_a_rib_falls_back_to_ocr() {
+        let content = std::fs::read("tests/fixtures/rib/text_layer_without_rib.pdf").unwrap();
+
+        let rib = vec_to_rib(content, "text_layer_without_rib.pdf")
+            .unwrap()
+            .expect("le RIB est lu par OCR");
+
+        assert_eq!(
+            crate::rib::normalize_iban(rib.iban()),
+            "FR7630001000644919009562088"
+        );
+    }
+
+    /// Un RIB fictif scanné en TIFF est lu comme une photo, au lieu d'être refusé
+    /// (« Unsupported file type: image/tiff »).
+    ///
+    /// Demande les modèles PP-OCR, absents de la CI :
+    ///     cargo test --release -- --ignored a_tiff_scan
+    #[test]
+    #[ignore = "demande les modèles PP-OCR (download-models.sh)"]
+    fn a_tiff_scan_is_read_like_a_photo() {
+        let content = std::fs::read("tests/fixtures/rib/rib_tiff.tif").unwrap();
+        let mut provenance = Provenance::default();
+
+        let rib = vec_to_rib_traced(content, "rib_tiff.tif", &mut provenance)
+            .unwrap()
+            .expect("le RIB est lu par OCR");
+
+        assert!(matches!(provenance.route, Some(Route::Image)));
+        assert_eq!(
+            crate::rib::normalize_iban(rib.iban()),
+            "FR7630001000644919009562088"
+        );
+    }
+
+    /// Le champ n'apparaît que quand il est vrai : le JSON des clients existants ne
+    /// change pas d'un octet.
+    #[test]
+    fn unreadable_is_absent_from_json_unless_true() {
+        let plain = serde_json::to_string(&Analysis::Rib {
+            rib: None,
+            unreadable: false,
         })
         .unwrap();
+        assert_eq!(plain, r#"{"hint":"rib","rib":null}"#);
 
-        Analysis::analyze(content, hint, base_name, &mut lt, &engine)
+        let flagged = serde_json::to_string(&Analysis::Rib {
+            rib: None,
+            unreadable: true,
+        })
+        .unwrap();
+        assert!(flagged.contains(r#""unreadable":true"#));
+
+        // et on relit l'ancien format sans le champ
+        let back: Analysis = serde_json::from_str(&plain).unwrap();
+        assert!(matches!(
+            back,
+            Analysis::Rib {
+                rib: None,
+                unreadable: false
+            }
+        ));
     }
 }

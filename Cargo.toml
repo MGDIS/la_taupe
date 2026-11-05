@@ -2,7 +2,7 @@
 name = "la_taupe"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.94.0"
+rust-version = "1.97.1"
 license-file = "LICENSE.txt"
 description = "La Taupe is a tool to extract administrative data from documents."
 authors = ["See git log"]
@@ -12,7 +12,8 @@ build = "build.rs"
 
 [dependencies]
 actix-web = "*"
-actix-multipart = "*"
+# 0.8 change le texte du 400 « champ manquant » renvoyé aux clients de /analyze/upload
+actix-multipart = "0.7"
 rxing = "*"
 nom = "*"
 chrono = { version = "*", features = ["serde"] }
@@ -27,7 +28,9 @@ tempfile = "*"
 log = "*"
 linfa = "*"
 linfa-clustering = "*"
-ndarray = "*"
+# pinned to the ndarray major linfa builds against: a wildcard resolves to a newer
+# major and the two ndarrays cannot exchange types
+ndarray = "0.16"
 env_logger = "*"
 regex = "*"
 scraper = "*"
@@ -37,10 +40,27 @@ serde_json = "*"
 tree_magic_mini = "*"
 reqwest = { version = "*", features = ["json", "blocking"] }
 url = "*"
-ocrs = "*"
-rten = "*"
+# PP-OCR (PaddleOCR) via ONNX Runtime, CPU only. Default engine since it is
+# both more accurate and 3-4x faster than ocrs, which it replaced outright
+# ONNX Runtime is fetched at build time and linked statically; the models are
+# fetched at build time by download-models.sh and embedded with include_bytes!.
+# The binary is self-contained: nothing is downloaded at runtime.
+oar-ocr = { version = "0.9", default-features = false, features = ["download-binaries", "simd"] }
+# Tesseract in-process (libtesseract), au lieu d'un processus `tesseract` par appel
 leptess = "*"
 tokio = { version = "*", features = ["sync", "time", "rt"] }
+
+[features]
+# Outillage de mesure (generateur de corpus synthetique + banc). Hors du binaire de prod.
+bench = []
+
+[[bin]]
+name = "synth"
+required-features = ["bench"]
+
+[[bin]]
+name = "bench"
+required-features = ["bench"]
 
 [dev-dependencies]
 assert_cmd = "*"
@@ -50,3 +70,6 @@ reqwest = { version = "*", features = ["multipart"] }
 
 [package.metadata.deb]
 depends = "poppler-utils, tesseract-ocr, tesseract-ocr-fra"
+# cargo-deb packages every [[bin]] by default, which trips on the
+# feature-gated bench/synth tooling: ship only the production binary
+assets = [["target/release/la_taupe", "usr/bin/", "755"]]

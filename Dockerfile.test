@@ -1,6 +1,6 @@
-FROM rust:1.94-bookworm
+FROM rust:1.97.1-trixie
 
-RUN apt-get update && apt-get install -y \
+RUN apt-get -o Acquire::Retries=5 update && apt-get -o Acquire::Retries=5 install -y \
     pkg-config \
     libssl-dev \
     libtesseract-dev \
@@ -16,18 +16,14 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-COPY Cargo.toml Cargo.lock build.rs ./
+COPY Cargo.toml Cargo.lock build.rs rust-toolchain.toml download-models.sh ./
+RUN mkdir -p models && bash download-models.sh
+
 COPY src ./src
 COPY tests ./tests
-
-RUN mkdir -p models && \
-    curl -L "https://ocrs-models.s3-accelerate.amazonaws.com/text-detection.rten" \
-    -o models/text-detection.rten && \
-    curl -L "https://ocrs-models.s3-accelerate.amazonaws.com/text-recognition.rten" \
-    -o models/text-recognition.rten
 
 RUN cd tests/fixtures/static_server && npm install 2>/dev/null || true
 
 RUN cargo build --release 2>&1
 
-CMD ["cargo", "test", "--release"]
+CMD ["cargo", "test", "--release", "--all-features"]

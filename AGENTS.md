@@ -9,19 +9,22 @@ La Taupe est un service HTTP (Rust / actix-web) qui extrait des données adminis
 - **RIB** : extraction IBAN / BIC / titulaire via OCR.
 - **2D-Doc** : lecture et vérification des codes-barres 2D-Doc de l'ANTS (datamatrix), avec vérification de signature contre les certificats de confiance.
 
-L'OCR repose sur deux moteurs complémentaires : **ocrs** (modèles `.rten` téléchargés au build) et **Tesseract** (via `leptess`, in-process). L'extraction texte des PDF utilise **poppler** (`pdftotext`) ; le rendu PDF→image passe aussi par poppler.
+L'OCR repose sur deux moteurs complémentaires : **PP-OCR v6 tiny** (crate `oar-ocr`, ONNX Runtime CPU lié statiquement, modèles `.onnx` téléchargés au build et embarqués via `include_bytes!`) pour la page, et **Tesseract** (via `leptess`, in-process) en repli sur les recadrages d'IBAN et pour l'angle de la page (hOCR). L'extraction texte des PDF utilise **poppler** (`pdftotext`) ; le rendu PDF→image passe aussi par poppler.
 
 ## Structure du code
 
-- `src/main.rs` — point d'entrée CLI : sans argument démarre le serveur, avec un chemin analyse un fichier. Options `--version`, `--help`, `--trusted-repositories-urls`.
+- `src/main.rs` — point d'entrée CLI : sans argument démarre le serveur, avec des chemins (fichiers ou répertoires) lance une analyse batch (une ligne JSON par fichier). Options `--type rib|2ddoc`, `--jobs N`, `--trace`, `--split-holder`, `--version`, `--help`, `--trusted-repositories-urls`.
 - `src/http/` — couche HTTP : `server.rs` (bootstrap, `AppState`, config multipart), `analyze.rs` (endpoints `/analyze` et `/analyze/upload`), `ping.rs`, `version.rs`.
 - `src/config.rs` — `AppConfig::from_env()` : centralise la lecture des variables d'environnement (voir plus bas).
 - `src/analysis.rs` — orchestration de l'analyse (`Analysis`, `Hint`, `Type`).
-- `src/pool.rs` — pools d'instances OCR (`LepTessPool`, `OcrEnginePool`) pour le contrôle de concurrence.
+- `src/pool.rs` — pool global synchrone d'instances Tesseract (`LepTessPool`), créées à la demande jusqu'à `LA_TAUPE_MAX_CONCURRENT_OCR`, empruntées le temps d'un appel (RAII). PP-OCR n'a pas de pool : une session partagée (`src/ppocr.rs`).
 - `src/twoddoc/` — parsing 2D-Doc, structure des données, certificats et signature.
-- `src/rib/`, `src/ocr.rs`, `src/ocrs.rs`, `src/tesseract.rs`, `src/text/` — extraction RIB et primitives OCR.
+- `src/rib.rs`, `src/ocr.rs` (cascade), `src/ppocr.rs`, `src/tesseract.rs`, `src/lines.rs`, `src/address_blocks.rs`, `src/gutters.rs`, `src/text/` — extraction RIB, titulaire et primitives OCR.
+- `src/provenance.rs`, `src/timing.rs` — trace de ce qu'a fait la cascade (`--trace`) et mesure des temps.
+- `src/bench/`, `src/synth/`, `src/bin/{bench,synth}.rs` — banc de mesure et corpus synthétique, derrière la feature `bench` (hors binaire de prod).
 - `src/file_utils.rs`, `src/image_utils.rs`, `src/datamatrix.rs` — utilitaires fichiers / images / datamatrix.
-- `build.rs` — injecte `GIT_HASH` et télécharge les modèles ocrs en profil release (`download-models.sh`). En profil debug, crée des modèles vides pour que `include_bytes!` compile.
+- `build.rs` — injecte `GIT_HASH` et télécharge les modèles PP-OCR en profil release (`download-models.sh`, vérification SHA-256). **Refuse un build release avec des modifications non commitées** (hors Docker, où `.git` est absent). En profil debug, crée des modèles vides pour que `include_bytes!` compile.
+- `rust-toolchain.toml` — toolchain épinglée (1.97.1).
 
 ## Endpoints HTTP
 
@@ -43,6 +46,7 @@ Toutes lues dans `src/config.rs` (sauf `LA_TAUPE_ADDRESS` dans `server.rs`). Val
 | `LA_TAUPE_OCR_TIMEOUT_SECS` | `120` | Timeout d'un traitement OCR (secondes). |
 | `LA_TAUPE_MAX_FILE_SIZE` | `10` | Taille max de fichier acceptée, **en mégaoctets** (convertie en octets en interne). S'applique à l'upload multipart et au téléchargement distant. |
 | `LA_TAUPE_ADDRESS` | `127.0.0.1:8080` | Adresse d'écoute du serveur. |
+| `LA_TAUPE_PPOCR_MODEL_DIR` | — | (upstream, optionnel) répertoire contenant `det.onnx`, `rec.onnx`, `dict.txt` pour essayer d'autres modèles PP-OCR sans rebuild. Lu dans `src/ppocr.rs`. |
 | `RUST_LOG` | `info` | Niveau de log (env_logger). |
 
 ## Build & exécution
@@ -50,7 +54,7 @@ Toutes lues dans `src/config.rs` (sauf `LA_TAUPE_ADDRESS` dans `server.rs`). Val
 Dépendances système requises : `pkg-config`, `libssl-dev`, `libtesseract-dev`, `libleptonica-dev`, `libclang-dev`, et au runtime `poppler-utils`, `tesseract-ocr`, `tesseract-ocr-fra`.
 
 ```bash
-cargo build --release        # build (télécharge les modèles ocrs si absents)
+cargo build --release        # build (télécharge les modèles PP-OCR si absents ; refuse si arbre non commité)
 ./download-models.sh         # télécharger les modèles manuellement si besoin
 cargo run                    # démarre le serveur
 ./launch_demo.sh             # démo : serveur node factice + la_taupe + curl sur un RIB

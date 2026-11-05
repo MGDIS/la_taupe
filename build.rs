@@ -18,54 +18,65 @@ fn main() {
     let profile = env::var("PROFILE").unwrap_or_default();
 
     if profile == "release" {
+        refuse_uncommitted_changes();
         download_models_if_needed();
     } else {
         fake_download_models();
     }
 }
 
-fn fake_download_models() {
-    let models_dir = Path::new("models");
-    let detection_model = models_dir.join("text-detection.rten");
-    let recognition_model = models_dir.join("text-recognition.rten");
-
-    // si les modeles existent et ne sont pas vides (deja telecharges), on ne les touche pas
-    let detection_ok = detection_model.exists()
-        && detection_model
-            .metadata()
-            .map(|m| m.len() > 0)
-            .unwrap_or(false);
-    let recognition_ok = recognition_model.exists()
-        && recognition_model
-            .metadata()
-            .map(|m| m.len() > 0)
-            .unwrap_or(false);
-
-    if detection_ok && recognition_ok {
+/// GIT_HASH names the bench results: a release binary built from uncommitted code
+/// would carry the hash of a commit it does not match. A failed build script leaves
+/// no fingerprint, so Cargo reruns it once the work is committed, and GIT_HASH
+/// follows. Untracked files do not count; without a git repository, nothing is checked.
+fn refuse_uncommitted_changes() {
+    let Ok(output) = Command::new("git")
+        .args(["status", "--porcelain", "--untracked-files=no"])
+        .output()
+    else {
+        return;
+    };
+    if !output.status.success() {
         return;
     }
-
-    // sinon on cree des fichiers vides pour que include_bytes! compile
-    if !detection_model.exists() {
-        std::fs::File::create(&detection_model).expect("Failed to create detection model file");
+    let changes = String::from_utf8_lossy(&output.stdout);
+    if !changes.trim().is_empty() {
+        panic!(
+            "release build refused: uncommitted changes, GIT_HASH would not match the code\n{}",
+            changes
+        );
     }
+}
 
-    if !recognition_model.exists() {
-        std::fs::File::create(&recognition_model).expect("Failed to create recognition model file");
+/// Every model file embedded in the binary via include_bytes!.
+const MODELS: [&str; 3] = [
+    "pp-ocrv6_tiny_det.onnx",
+    "pp-ocrv6_tiny_rec.onnx",
+    "ppocrv6_dict.txt",
+];
+
+fn fake_download_models() {
+    let models_dir = Path::new("models");
+
+    // on cree les fichiers models vides si les fichiers n'existent pas
+    for name in MODELS {
+        let path = models_dir.join(name);
+        if !path.exists() {
+            std::fs::File::create(&path)
+                .unwrap_or_else(|e| panic!("Failed to create {}: {}", name, e));
+        }
     }
 }
 
 fn download_models_if_needed() {
     let models_dir = Path::new("models");
-    let detection_model = models_dir.join("text-detection.rten");
-    let recognition_model = models_dir.join("text-recognition.rten");
 
-    let missing_detection_model =
-        !detection_model.exists() || detection_model.metadata().unwrap().len() == 0;
-    let missing_recognition_model =
-        !recognition_model.exists() || recognition_model.metadata().unwrap().len() == 0;
+    let missing = MODELS.iter().any(|name| {
+        let path = models_dir.join(name);
+        !path.exists() || path.metadata().unwrap().len() == 0
+    });
 
-    if missing_detection_model || missing_recognition_model {
+    if missing {
         println!("Downloading models...");
 
         let output = Command::new("bash")
