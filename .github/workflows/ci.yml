@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v3
 
-      - uses: dtolnay/rust-toolchain@1.94.0
+      - uses: dtolnay/rust-toolchain@1.97.1
         with: { components: rustfmt }
 
       - run: cargo fmt --all -- --check
@@ -27,7 +27,7 @@ jobs:
     steps:
       - uses: actions/checkout@v3
 
-      - uses: dtolnay/rust-toolchain@1.94.0
+      - uses: dtolnay/rust-toolchain@1.97.1
         with: { components: clippy }
 
       - name: Install system dependencies
@@ -39,7 +39,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Check with Clippy
-        run: cargo clippy
+        run: cargo clippy --all-features --all-targets
 
   test:
     name: cargo test
@@ -47,7 +47,7 @@ jobs:
     steps:
       - uses: actions/checkout@v3
 
-      - uses: dtolnay/rust-toolchain@1.94.0
+      - uses: dtolnay/rust-toolchain@1.97.1
 
       - name: Cache Dependencies
         uses: Swatinem/rust-cache@v2
@@ -66,7 +66,7 @@ jobs:
       - name: Install Node Dependencies
         run: yarn install --cwd tests/fixtures/static_server
 
-      - name: Download OCRS models
+      - name: Download OCR models (PP-OCR)
         run: bash download-models.sh
 
       - run: cargo test --all-features

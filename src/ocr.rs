@@ -1,106 +1,254 @@
 use std::io::Cursor;
 
-use image::{DynamicImage, ImageDecoder, ImageFormat, ImageReader};
-use leptess::LepTess;
+use image::{DynamicImage, ImageDecoder, ImageReader};
 use log::trace;
-use ocrs::{OcrEngine, TextLine};
 use regex::Regex;
 
 use crate::{
-    image_utils::{clean_image, only_rotate, resize, rotate, save_image_in_debug},
-    ocrs::{extract_anchors, image_to_string_using_ocrs, ocrs_anchors},
-    rib::{extract_fr_bic, extract_iban, Rib},
+    address_blocks::{address_blocks, read_rect, segments, Segment, LEGAL_FORM},
+    gutters::column_span,
+    image_utils::{clean_image, only_rotate, resize, rotate, rotate_rect, save_image_in_debug},
+    lines::{extract_anchors, max_line_height, TextLine},
+    ppocr::{
+        image_to_string, recognize, recognize_anchors, recognize_at_line_height, DETECTION_SIDE,
+        TARGET_LINE_HEIGHT,
+    },
+    provenance::{AnchorSource, BlockOutcome, Engine, HolderBlock, OcrLine, Provenance, TextStats},
+    rib::{extract_fr_bic, extract_iban, join_cell_letters, Rib},
+    shapes::{Anchor, Point},
     tesseract::{img_to_string_using_tesseract, tess_analyze},
     text::simple_account_holder::find_simple_account_holder,
 };
 
 const OPTIMAL_TESSERACT_HEIGHT: u32 = 30;
 
-fn encode_png(img: &DynamicImage) -> Vec<u8> {
-    let mut buffer = Cursor::new(Vec::new());
-    img.write_to(&mut buffer, ImageFormat::Png).unwrap();
-    buffer.into_inner()
+pub fn image_bytes_to_rib(content: Vec<u8>, name: &str) -> Option<Rib> {
+    image_bytes_to_rib_traced(content, name, &mut Provenance::default())
 }
 
-fn increase_image_size_if_needed(img: DynamicImage) -> DynamicImage {
-    if img.width() >= 500 && img.height() >= 500 {
-        return img;
-    }
-    img.resize(
-        img.width() * 2,
-        img.height() * 2,
-        image::imageops::FilterType::Lanczos3,
-    )
-}
-
-pub fn image_bytes_to_rib(
-    lt: &mut LepTess,
-    engine: &OcrEngine,
+/// Même traitement, en consignant au passage la stratégie qui a abouti.
+pub fn image_bytes_to_rib_traced(
     content: Vec<u8>,
     name: &str,
+    provenance: &mut Provenance,
 ) -> Option<Rib> {
     let img = bytes_to_img(content)?;
+
+    provenance.image_width = img.width();
+    provenance.image_height = img.height();
+
     save_image_in_debug(&img, name, "");
 
-    zoom_and_extract(lt, engine, &img, name).or_else(|| {
-        let cleaned_img = clean_image(&img, name);
-        zoom_and_extract(lt, engine, &cleaned_img, name)
-    })
+    if let Some(rib) = zoom_and_extract(&img, name, provenance) {
+        return Some(rib);
+    }
+
+    provenance.second_pass = true;
+
+    let cleaned_img = clean_image(&img, name);
+    zoom_and_extract(&cleaned_img, name, provenance)
 }
 
 pub fn zoom_and_extract(
-    lt: &mut LepTess,
-    engine: &OcrEngine,
     img: &DynamicImage,
     name: &str,
+    provenance: &mut Provenance,
 ) -> Option<Rib> {
-    let mut rib = None;
     let iban_regex = Regex::new(r"(?:^|\s)FR[\dO]").unwrap();
 
-    let (ocrs_text, text_lines, maybe_anchors) = ocrs_anchors(engine, img, &iban_regex, None);
+    let (page_text, text_lines, maybe_anchors) = recognize_anchors(img, &iban_regex, None);
+
+    // Page lue de haut en bas sans que l'IBAN y soit lu : toute la suite de la cascade —
+    // recadrages autour d'ancres hautes de trois cents pixels — tomberait à côté. On la
+    // mène sur la page redressée.
+    //
+    // Page à l'envers — scan posé tête en bas —, lue sans un IBAN ni une ancre d'IBAN :
+    // PP-OCR ne redresse pas un demi-tour et seul tesseract la rattrapait, en plusieurs
+    // secondes, et pas sur un scan crénelé ou penché. On relit la page retournée.
+    let turned;
+    // `turn` : l'image lue est la page tournée de tant de degrés, sens horaire — pour
+    // ramener à la page la place des blocs candidats au titulaire
+    let (img, page_text, text_lines, maybe_anchors, turn) = if extract_iban(&page_text).is_some() {
+        (img, page_text, text_lines, maybe_anchors, 0)
+    } else if mostly_vertical(&text_lines) {
+        match turn_upright(img, &iban_regex) {
+            Some((image, text, lines, anchors, turn)) => {
+                turned = image;
+                (&turned, text, lines, anchors, turn)
+            }
+            None => (img, page_text, text_lines, maybe_anchors, 0),
+        }
+    } else if maybe_anchors.is_empty() && !text_lines.is_empty() {
+        match turn_over(img, &iban_regex) {
+            Some((image, text, lines, anchors)) => {
+                turned = image;
+                (&turned, text, lines, anchors, 180)
+            }
+            None => (img, page_text, text_lines, maybe_anchors, 0),
+        }
+    } else {
+        (img, page_text, text_lines, maybe_anchors, 0)
+    };
     let maybe_anchor = maybe_anchors.first();
 
-    if let Some(iban) = extract_iban(&ocrs_text) {
-        trace!("early returns from ocrs for: {}", name);
-        let bic = extract_fr_bic(&ocrs_text);
-        let account_holder = zoom_and_extract_account_holder(engine, img, text_lines, name);
+    // Empreinte de forme du texte de la page : des comptes, jamais le texte. On garde la
+    // lecture la plus fournie — la seconde passe, sur image nettoyée, peut lire ce que
+    // la première n'a pas vu, et le drapeau « illisible » ne doit porter que sur ce que
+    // le prétraitement n'a pas su rattraper.
+    let stats = TextStats::of(&page_text);
+    let richer = provenance
+        .page_text_stats
+        .as_ref()
+        .is_none_or(|prev| stats.alphas + stats.digits > prev.alphas + prev.digits);
+    if richer {
+        provenance.page_text_stats = Some(stats);
+    }
+
+    if let Some(anchor) = maybe_anchor {
+        provenance.anchor = Some(AnchorSource::PpOcr);
+        provenance.anchor_height = Some(anchor.height);
+    }
+
+    if let Some(iban) = extract_iban(&page_text) {
+        trace!("early returns from page text for: {}", name);
+
+        provenance.engine = Some(Engine::PpOcrPage);
+
+        let bic = extract_bic(img, &page_text, &text_lines, &iban, name);
+        let (holder_img, holder_lines, holder_turn) =
+            match upright(img, &text_lines, &iban, &iban_regex) {
+                Some((image, lines, extra)) => (image, lines, (turn + extra) % 360),
+                None => (img.clone(), text_lines, turn),
+            };
+        // Sur une page A4 entière, scannée ou photographiée, un texte en corps courant ne
+        // fait plus qu'une dizaine de pixels d'interligne une fois la page réduite au
+        // côté de détection : le détecteur saute des lignes, souvent celles du titulaire.
+        // Mesuré sur la campagne 2026-10-06 : six titulaires sur sept dont aucun code
+        // postal n'est lu sont sous 13 px, contre 20 px de médiane pour ceux qui sont
+        // lus. Toute la cascade est réglée sur les lignes vues à ce côté — y chercher le
+        // titulaire sur une lecture plus fine perdait deux fois plus qu'il ne gagnait :
+        // elle ne sert qu'en repli, quand la lecture ordinaire n'a rien donné.
+        //
+        // Le repli relit le texte de la page, recadré sur lui, à la taille où la cascade
+        // est réglée : un RIB dans un coin de feuille y est agrandi plus que ne le ferait
+        // une détection fine de toute la page, une page A4 entière n'y est pas lue plus
+        // gros que nécessaire. Une page dont les lignes ont déjà à peu près cette taille
+        // n'est pas relue : elle le serait à l'identique.
+        //
+        // Le titulaire sous son libellé attend le repli : sur une lecture réduite, il ne
+        // sort que les lignes que le détecteur n'a pas sautées — le nom sans son adresse —,
+        // et le relire empêchait le repli de lire le bloc entier.
+        const MIN_GAIN: f32 = 1.3;
+        let page_lines = holder_lines.clone();
+        let fine = text_frame(&holder_img, &page_lines).filter(|&(_, line_height)| {
+            TARGET_LINE_HEIGHT >= MIN_GAIN * at_detection(&holder_img, line_height)
+        });
+        let account_holder = zoom_and_extract_account_holder_traced(
+            &holder_img,
+            holder_lines,
+            name,
+            provenance,
+            Some(holder_turn),
+            fine.is_none(),
+        )
+        .or_else(|| {
+            let (rect, line_height) = fine?;
+            provenance.fine_lines = true;
+            provenance.content_crop = page_rect(&holder_img, rect, Some(holder_turn));
+            let cropped = holder_img.crop_imm(rect.0, rect.1, rect.2, rect.3);
+            let lines = recognize_at_line_height(&cropped, line_height)
+                .iter()
+                .map(|l| l.placed(1.0, rect.0 as i32, rect.1 as i32))
+                .collect();
+            zoom_and_extract_account_holder_traced(
+                &holder_img,
+                lines,
+                name,
+                provenance,
+                Some(holder_turn),
+                true,
+            )
+        })
+        .or_else(|| {
+            fine?;
+            holder_under_label(&holder_img, &page_lines, provenance, Some(holder_turn))
+                .map(|h| unglue(&h))
+        });
+
         return Some(Rib::from_iban(iban, account_holder, bic));
     };
 
     if let Some(anchor) = maybe_anchor {
-        trace!("ocrs anchor found");
+        trace!("ppocr anchor found");
 
         let iban_image = crop(img, anchor.iban_mask(), name, "mask");
-        let iban = extract_iban_in_image(lt, engine, &iban_image, name);
 
-        if let Some(iban) = iban {
-            let account_holder =
-                zoom_and_extract_account_holder(engine, img, text_lines.clone(), name);
-            let bic = extract_fr_bic(&ocrs_text);
-            rib = Some(Rib::from_iban(iban, account_holder, bic));
-        } else {
-            // maybe this is a long iban with some | between words
-            let iban_image = crop(img, anchor.narrow_iban_mask(), name, "narrow_mask");
-            let iban = extract_iban_in_image(lt, engine, &iban_image, name);
+        if let Some(iban) = extract_iban_in_image(&iban_image, name) {
+            provenance.engine = Some(Engine::PpOcrCrop);
 
-            if let Some(iban) = iban {
-                let account_holder = zoom_and_extract_account_holder(engine, img, text_lines, name);
-                let bic = extract_fr_bic(&ocrs_text);
-                rib = Some(Rib::from_iban(iban, account_holder, bic));
-            }
+            let bic = extract_bic(img, &page_text, &text_lines, &iban, name);
+            let account_holder = zoom_and_extract_account_holder_traced(
+                img,
+                text_lines.clone(),
+                name,
+                provenance,
+                Some(turn),
+                true,
+            );
+
+            return Some(Rib::from_iban(iban, account_holder, bic));
+        }
+
+        // maybe this is a long iban with some | between words
+        let iban_image = crop(img, anchor.narrow_iban_mask(), name, "narrow_mask");
+
+        if let Some(iban) = extract_iban_in_image(&iban_image, name) {
+            provenance.engine = Some(Engine::PpOcrNarrowCrop);
+
+            let bic = extract_bic(img, &page_text, &text_lines, &iban, name);
+            let account_holder = zoom_and_extract_account_holder_traced(
+                img,
+                text_lines,
+                name,
+                provenance,
+                Some(turn),
+                true,
+            );
+
+            return Some(Rib::from_iban(iban, account_holder, bic));
         }
     }
 
-    if rib.is_some() {
-        return rib;
+    let (_hocr_string, maybe_angle, maybe_anchor) = tess_analyze(img);
+
+    if let Some(angle) = maybe_angle {
+        provenance.angle_deg = Some(angle.to_degrees());
     }
 
-    let (_hocr_string, maybe_angle, maybe_anchor) = tess_analyze(lt, &encode_png(img));
-
+    // Après rotation, l'ancre était redétectée par une seconde analyse hocr de la page
+    // entière — quatre à cinq secondes pour une position qui se calcule : la rotation
+    // d'un rectangle est de la géométrie. La seconde analyse ne reste que lorsqu'il n'y
+    // avait pas d'ancre avant rotation, auquel cas elle cherche et ne redécouvre pas.
     let (img, maybe_anchor) = maybe_angle
         .map(|angle| {
             let rotated_img = rotate(img, angle);
-            let (_, _, new_anchor) = tess_analyze(lt, &encode_png(&rotated_img));
+            let new_anchor = match &maybe_anchor {
+                Some(anchor) => {
+                    let (x, y, w, h) = rotate_rect(
+                        (
+                            anchor.top_left.x,
+                            anchor.top_left.y,
+                            anchor.width,
+                            anchor.height,
+                        ),
+                        img.width(),
+                        img.height(),
+                        angle,
+                    );
+                    Some(Anchor::new(Point::new(x, y), Point::new(x + w, y + h)))
+                }
+                None => tess_analyze(&rotated_img).2,
+            };
             (rotated_img, new_anchor)
         })
         .unwrap_or((img.clone(), maybe_anchor));
@@ -108,143 +256,1320 @@ pub fn zoom_and_extract(
     if let Some(anchor) = maybe_anchor {
         trace!("tess anchor found");
 
+        if provenance.anchor.is_none() {
+            provenance.anchor = Some(AnchorSource::Tesseract);
+            provenance.anchor_height = Some(anchor.height);
+        }
+
         let iban_image = crop(&img, anchor.iban_mask(), name, "mask");
 
         let iban_image = only_rotate(&iban_image, name);
         let iban_image = resize(&iban_image, anchor.height, OPTIMAL_TESSERACT_HEIGHT);
         save_image_in_debug(&iban_image, name, "rotated_resized_mask");
 
-        let iban = extract_iban_in_image(lt, engine, &iban_image, name);
-        if let Some(iban) = iban {
-            let (ocrs_text, text_lines, _) = ocrs_anchors(engine, &img, &iban_regex, None);
-            let account_holder = zoom_and_extract_account_holder(engine, &img, text_lines, name);
-            let bic = extract_fr_bic(&ocrs_text);
-            rib = Some(Rib::from_iban(iban, account_holder, bic));
+        if let Some(iban) = extract_iban_in_image(&iban_image, name) {
+            provenance.engine = Some(Engine::TessCrop);
+
+            let (page_text, text_lines, _) = recognize_anchors(&img, &iban_regex, None);
+            let bic = extract_bic(&img, &page_text, &text_lines, &iban, name);
+            // un angle quelconque ne se ramène pas à la page par un quart de tour
+            let holder_turn = maybe_angle.is_none_or(|a| a.abs() < 0.02).then_some(turn);
+            let account_holder = zoom_and_extract_account_holder_traced(
+                &img,
+                text_lines,
+                name,
+                provenance,
+                holder_turn,
+                true,
+            );
+
+            return Some(Rib::from_iban(iban, account_holder, bic));
         }
     }
 
-    rib
+    None
 }
 
-fn zoom_and_extract_account_holder(
-    engine: &OcrEngine,
+/// Le texte lu : son rectangle, marge comprise, et la hauteur médiane de ses lignes, en
+/// pixels de l'image. Les détections d'un ou deux caractères — une poussière, un filet —
+/// ne comptent pas ; avec moins de cinq lignes pour en juger, le rectangle est la page.
+fn text_frame(img: &DynamicImage, lines: &[TextLine]) -> Option<((u32, u32, u32, u32), f32)> {
+    let rects: Vec<crate::lines::Rect> = lines
+        .iter()
+        .filter(|l| l.to_string().chars().filter(|c| !c.is_whitespace()).count() >= 3)
+        .map(|l| l.bounding_rect())
+        .collect();
+    let mut heights: Vec<i32> = rects.iter().map(|r| r.height()).collect();
+    heights.sort_unstable();
+    let height = *heights.get(heights.len() / 2)?;
+    let page = (0, 0, img.width(), img.height());
+    if rects.len() < 5 {
+        return Some((page, height as f32));
+    }
+
+    // de quoi rattraper les lignes que la lecture réduite a sautées, en bord de RIB
+    let margin = 3 * height.max(1);
+    let left = (rects.iter().map(|r| r.left()).min()? - margin).max(0) as u32;
+    let top = (rects.iter().map(|r| r.top()).min()? - margin).max(0) as u32;
+    let right = ((rects.iter().map(|r| r.right()).max()? + margin).max(0) as u32).min(img.width());
+    let bottom =
+        ((rects.iter().map(|r| r.bottom()).max()? + margin).max(0) as u32).min(img.height());
+    if right <= left || bottom <= top {
+        return Some((page, height as f32));
+    }
+    Some(((left, top, right - left, bottom - top), height as f32))
+}
+
+/// Hauteur en pixels du détecteur ordinaire d'une ligne de `height` pixels de l'image :
+/// la page y est réduite à DETECTION_SIDE, jamais agrandie.
+fn at_detection(img: &DynamicImage, height: f32) -> f32 {
+    let side = img.width().max(img.height()).max(1) as f32;
+    height * (DETECTION_SIDE as f32 / side).min(1.0)
+}
+
+/// Libellé de titulaire posé à gauche du bloc d'un code postal, dans la hauteur de ce
+/// bloc — le plus proche au-dessus du code postal —, rendu par son haut et son bord droit.
+fn side_label(
+    text_lines: &[TextLine],
+    anchor: &Anchor,
+    holder_label: &Regex,
+) -> Option<(u32, u32)> {
+    let (_, mask_top, _, _) = anchor.addr_mask();
+    let block_top = mask_top as i32;
+    let block_bottom = anchor.bottom_right.y as i32;
+    let postal_left = anchor.top_left.x as i32;
+
+    text_lines
+        .iter()
+        .filter(|line| holder_label.is_match(&line.to_string()))
+        .map(|line| line.bounding_rect())
+        .filter(|r| {
+            let center = (r.top() + r.bottom()) / 2;
+            center >= block_top && center <= block_bottom && r.right() <= postal_left
+        })
+        .max_by_key(|r| r.top())
+        .map(|r| (r.top().max(0) as u32, r.right().max(0) as u32))
+}
+
+/// Recadrage du bloc entre la hauteur du libellé et le code postal. Vers la gauche, il
+/// va aussi loin que le masque aligné à droite — un nom aligné à droite déborde du code
+/// postal — sans passer le libellé.
+fn side_mask(anchor: &Anchor, (label_top, label_right): (u32, u32)) -> (u32, u32, u32, u32) {
+    let (align_x, _, width, _) = anchor.right_align_addr_mask();
+    let x = align_x.max(label_right);
+    let right = align_x + width;
+    let y = label_top.saturating_sub(anchor.height / 2);
+    let bottom = anchor.bottom_right.y + anchor.height / 2;
+
+    (
+        x,
+        y,
+        right.saturating_sub(x).max(1),
+        bottom.saturating_sub(y).max(1),
+    )
+}
+
+/// Haut de la ligne qui désigne le titulaire — civilité, forme juridique, libellé — posée
+/// au-dessus du masque d'un code postal, dans sa largeur. Le masque ne monte que d'une
+/// hauteur fixe : des lignes blanches entre le nom et l'adresse (« Nom et adresse du
+/// titulaire / G.A.E.C. … / (vide) / rue / (vide) / code postal ») laissent hors champ
+/// tout ce qui désignait le bloc, et il était écarté. On cherche jusqu'à six lignes plus
+/// haut, la plus proche d'abord ; une autre ligne de code postal arrête la recherche :
+/// au-delà, c'est un autre bloc.
+fn designation_above(
+    segments: &[Segment],
+    anchor: &Anchor,
+    holder_label: &Regex,
+    postal_line: &Regex,
+) -> Option<u32> {
+    let (x, top, width, _) = anchor.addr_mask();
+    let (left, right, top) = (x as i32, (x + width) as i32, top as i32);
+    let reach = 6 * anchor.height as i32;
+
+    let mut above: Vec<&Segment> = segments
+        .iter()
+        .filter(|s| s.x1 > left && s.x0 < right && s.y0 < top && s.y0 >= top - reach)
+        .collect();
+    above.sort_by_key(|s| -s.y0);
+    above
+        .into_iter()
+        .take_while(|s| !postal_line.is_match(&s.text))
+        .find(|s| match_civilite(&s.text) || holder_label.is_match(&s.text))
+        .map(|s| s.y0.max(0) as u32)
+}
+
+/// Le masque d'un code postal remonté jusqu'à la ligne qui le désigne.
+fn above_mask(anchor: &Anchor, designation_top: u32) -> (u32, u32, u32, u32) {
+    let (x, _, width, _) = anchor.addr_mask();
+    let y = designation_top.saturating_sub(anchor.height / 2);
+    let bottom = anchor.bottom_right.y + anchor.height / 2;
+
+    (x, y, width, bottom.saturating_sub(y).max(1))
+}
+
+/// Vrai si la page se lit de haut en bas : la plupart de ses lignes un peu longues sont
+/// plus hautes que larges. C'est une photo prise appareil tourné d'un quart de tour.
+fn mostly_vertical(lines: &[TextLine]) -> bool {
+    let long: Vec<&TextLine> = lines
+        .iter()
+        .filter(|l| l.to_string().chars().count() >= 6)
+        .collect();
+    let vertical = long
+        .iter()
+        .filter(|l| {
+            let r = l.bounding_rect();
+            r.height() > r.width()
+        })
+        .count();
+
+    long.len() >= 3 && vertical * 2 > long.len()
+}
+
+/// Redresse d'un quart de tour une page lue de haut en bas, pour le titulaire.
+///
+/// PP-OCR lit l'IBAN d'une photo pivotée, mais ses lignes sont alors des colonnes :
+/// hautes de trois cents pixels, elles font des ancres de code postal démesurées, et
+/// tous les masques du bloc adresse — des multiples de leur hauteur — tombent à côté.
+/// Le titulaire était perdu sur chaque photo prise appareil tourné, un quart des photos
+/// réelles. On relit la page tournée dans un sens, puis dans l'autre, et on garde celui
+/// qui redonne le même IBAN en lignes horizontales. Rien n'est relu pour une page droite.
+fn upright(
+    img: &DynamicImage,
+    text_lines: &[TextLine],
+    iban: &str,
+    iban_regex: &Regex,
+) -> Option<(DynamicImage, Vec<TextLine>, u16)> {
+    if !mostly_vertical(text_lines) {
+        return None;
+    }
+
+    [(img.rotate90(), 90), (img.rotate270(), 270)]
+        .into_iter()
+        .find_map(|(rotated, turn)| {
+            let (text, lines, _) = recognize_anchors(&rotated, iban_regex, None);
+            let same_iban = extract_iban(&text).as_deref() == Some(iban);
+
+            (same_iban && !mostly_vertical(&lines)).then_some((rotated, lines, turn))
+        })
+}
+
+/// Page tournée d'un quart de tour : l'image, sa lecture, ses lignes, ses ancres d'IBAN
+/// et l'angle du quart de tour, sens horaire.
+type TurnedPage = (DynamicImage, String, Vec<TextLine>, Vec<Anchor>, u16);
+
+/// Relit une page pivotée d'un quart de tour dans les deux sens, et garde la lecture la
+/// plus probante : celle qui donne un IBAN, sinon celle qui porte le plus d'ancres
+/// d'IBAN, puis le plus de vocabulaire de RIB, puis de caractères — le sens tête en bas
+/// lit du bruit.
+fn turn_upright(img: &DynamicImage, iban_regex: &Regex) -> Option<TurnedPage> {
+    [(img.rotate90(), 90), (img.rotate270(), 270)]
+        .into_iter()
+        .map(|(rotated, turn)| {
+            let (text, lines, anchors) = recognize_anchors(&rotated, iban_regex, None);
+            (rotated, text, lines, anchors, turn)
+        })
+        .filter(|(_, _, lines, _, _)| !mostly_vertical(lines))
+        .max_by_key(|(_, text, _, anchors, _)| {
+            let stats = TextStats::of(text);
+            (
+                extract_iban(text).is_some(),
+                anchors.len(),
+                stats.vocabulary_hits,
+                stats.alphas + stats.digits,
+            )
+        })
+}
+
+/// Relit une page retournée d'un demi-tour, et ne la garde que si l'IBAN s'y lit : à
+/// l'endroit, une page sans IBAN lisible le reste à l'envers.
+fn turn_over(
+    img: &DynamicImage,
+    iban_regex: &Regex,
+) -> Option<(DynamicImage, String, Vec<TextLine>, Vec<Anchor>)> {
+    let rotated = img.rotate180();
+    let (text, lines, anchors) = recognize_anchors(&rotated, iban_regex, None);
+
+    extract_iban(&text)
+        .is_some()
+        .then_some((rotated, text, lines, anchors))
+}
+
+fn match_civilite(s: &str) -> bool {
+    find_civilite(s).is_some()
+}
+
+/// Position du début du bloc titulaire quand un libellé le désigne : ce qui suit le
+/// libellé sur sa ligne (« Titulaire : M … »), sinon la ligne suivante (« Nom et
+/// adresse du bénéficiaire » en ligne à part).
+fn after_holder_label(s: &str) -> Option<usize> {
+    let label = Regex::new(
+        r"(?i)(nom et adresse du )?(titulaire|intitul[ée]|account owner|b[ée]n[ée]ficiaire)s?( du compte| de compte| du client)?\s*(n[°o]\s*)?[:.\-]*",
+    )
+    .unwrap();
+    let m = label.find(s)?;
+
+    let line_end = s[m.end()..]
+        .find('\n')
+        .map(|i| m.end() + i)
+        .unwrap_or(s.len());
+
+    let rest = s[m.end()..line_end].trim();
+    if rest.is_empty() {
+        (line_end < s.len()).then_some(line_end + 1)
+    } else {
+        Some(line_end - (s[m.end()..line_end].trim_start().len()))
+    }
+}
+
+fn find_civilite(s: &str) -> Option<usize> {
+    // « M.OU MME » : le point colle la première civilité au « OU » ; sans ce préfixe,
+    // seule « MME » était reconnue, et le titulaire perdait son « M.OU »
+    let civilite = Regex::new(
+        r"(?i)(^|\s)((m|mr|monsieur)\.?\s*ou\s+)?(m|monsieur|mr|mademoiselle|ml|mle|mlle|melle|madame|mme)\.?\s",
+    )
+    .unwrap();
+    let prenom_nom_ou =
+        Regex::new(r"[[:upper:]]+ +[[:upper:]]+ +OU +[[:upper:]]+ +[[:upper:]]+").unwrap();
+    // Une personne morale n'a pas de civilité : sa forme juridique en tête de ligne joue
+    // le même rôle — « ASSOC. LES AMIS DE… », « SARL LES FAUVES » —, comme le comptable
+    // public d'une collectivité.
+    let legal_form = Regex::new(&format!(r"(?m)^\s*({LEGAL_FORM})\s")).unwrap();
+
+    civilite
+        .find(s)
+        .or_else(|| prenom_nom_ou.find(s))
+        .map(|m| m.start())
+        .or_else(|| {
+            legal_form
+                .captures(s)
+                .and_then(|c| c.get(1))
+                .map(|m| m.start())
+        })
+}
+
+/// Lit le BIC : par motif dans le texte de la page, d'abord tel quel, puis les
+/// cellules recollées ; enfin, faute de candidat, en recadrant autour du libellé.
+///
+/// Le BIC n'avait qu'une regex sur la première lecture. Or sur les documents réels il
+/// est souvent imprimé dans un tableau à une lettre par cellule : l'OCR rend les
+/// cellules comme des mots courts — « Ps sƫ FRP P NƫE » — et la regex ne voit jamais
+/// la suite entière. La lecture pleine page est pourtant la bonne : recadrer la zone
+/// fait perdre le contexte et les moteurs n'y voient que des traits. Il suffit de
+/// recoller les cellules avant d'appliquer le motif.
+fn extract_bic(
+    img: &DynamicImage,
+    page_text: &str,
+    text_lines: &[TextLine],
+    iban: &str,
+    name: &str,
+) -> Option<String> {
+    if let Some(bic) = extract_fr_bic(page_text, Some(iban)) {
+        return Some(bic);
+    }
+
+    if let Some(bic) = extract_fr_bic(&join_cell_letters(page_text), Some(iban)) {
+        trace!("BIC par recollement des cellules");
+        return Some(bic);
+    }
+
+    // Sur d'autres documents, l'OCR rend chaque cellule comme une ligne à part entière,
+    // côte à côte à la même hauteur : ligne par ligne, rien à recoller. On les réunit
+    // par la géométrie — même bande verticale, ordre horizontal — avant le motif.
+    let rows = join_cell_lines(text_lines);
+    if let Some(bic) = extract_fr_bic(&rows, Some(iban)) {
+        trace!("BIC par recollement géométrique des cellules");
+        return Some(bic);
+    }
+
+    let bic_word = Regex::new(r"(?i)^bic\b").unwrap();
+    let anchors = extract_anchors(text_lines.to_vec(), &bic_word, None);
+
+    for (index, anchor) in anchors.iter().enumerate().take(2) {
+        let cropped = crop(img, anchor.bic_mask(), name, &format!("{}_bic_mask", index));
+        let text = join_cell_letters(&image_to_string(cropped));
+        if let Some(bic) = extract_fr_bic(&text, Some(iban)) {
+            trace!("BIC par recadrage sur le libellé");
+            return Some(bic);
+        }
+    }
+
+    None
+}
+
+/// Réunit en lignes les fragments reconnus séparément mais alignés à la même hauteur —
+/// typiquement les cellules d'un tableau, une lettre chacune, que le détecteur rend
+/// comme autant de lignes. Rend un texte où chaque bande verticale est une ligne, les
+/// fragments joints sans espace quand ils sont courts et contigus, par un espace sinon.
+fn join_cell_lines(text_lines: &[TextLine]) -> String {
+    let mut items: Vec<(i32, i32, i32, String)> = text_lines
+        .iter()
+        .map(|l| {
+            let r = l.bounding_rect();
+            (r.top(), r.left(), r.height().max(1), l.to_string())
+        })
+        .collect();
+    items.sort_by_key(|(top, left, _, _)| (*top, *left));
+
+    let mut rows: Vec<Vec<(i32, i32, String)>> = Vec::new();
+    let mut row_top: i32 = i32::MIN;
+    let mut row_h: i32 = 1;
+    for (top, left, h, text) in items {
+        let same_band = (top - row_top).abs() < row_h.max(h) / 2;
+        if same_band {
+            rows.last_mut().unwrap().push((left, h, text));
+        } else {
+            rows.push(vec![(left, h, text)]);
+            row_top = top;
+            row_h = h;
+        }
+    }
+
+    rows.into_iter()
+        .map(|mut row| {
+            row.sort_by_key(|(left, _, _)| *left);
+            let mut out = String::new();
+            let mut prev_end: Option<i32> = None;
+            for (left, h, text) in row {
+                let short = text.chars().count() <= 3;
+                // contigu : l'écart est inférieur à une hauteur de ligne
+                let contiguous = prev_end.is_some_and(|e| left - e < h);
+                let glue = short && contiguous;
+                if !out.is_empty() && !glue {
+                    out.push(' ');
+                }
+                out.push_str(&text);
+                // largeur approchée : une hauteur par caractère
+                prev_end = Some(left + text.chars().count() as i32 * h);
+            }
+            out
+        })
+        .collect::<Vec<String>>()
+        .join("\n")
+}
+
+/// Texte des lignes déjà reconnues dont la boîte tombe dans le masque, dans l'ordre
+/// vertical, avec les mots de chaque ligne triés de gauche à droite.
+///
+/// Sert à trier les candidats avant de payer un recadrage : la page a été reconnue une
+/// fois, et son texte suffit à dire si un voisinage ressemble à une domiciliation ou à
+/// un titulaire. Il ne remplace pas le recadrage pour la lecture elle-même.
+fn text_in_mask(text_lines: &[TextLine], (x, y, w, h): (u32, u32, u32, u32)) -> String {
+    let (left, top, right, bottom) = (x as i32, y as i32, (x + w) as i32, (y + h) as i32);
+
+    let mut rows: Vec<(i32, String)> = text_lines
+        .iter()
+        .filter_map(|line| {
+            let mut words: Vec<(i32, String)> = line
+                .words()
+                .filter(|word| {
+                    let r = word.bounding_rect();
+                    let cx = (r.left() + r.right()) / 2;
+                    let cy = (r.top() + r.bottom()) / 2;
+                    cx >= left && cx < right && cy >= top && cy < bottom
+                })
+                .map(|word| (word.bounding_rect().left(), word.to_string()))
+                .collect();
+
+            if words.is_empty() {
+                return None;
+            }
+            words.sort_by_key(|(x, _)| *x);
+
+            let text = words
+                .into_iter()
+                .map(|(_, w)| w)
+                .collect::<Vec<String>>()
+                .join(" ");
+            Some((line.bounding_rect().top(), text))
+        })
+        .collect();
+
+    rows.sort_by_key(|(top, _)| *top);
+    rows.into_iter()
+        .map(|(_, t)| t)
+        .collect::<Vec<String>>()
+        .join("\n")
+}
+
+/// Rectangle d'un recadrage en fractions de la page d'origine, l'image lue étant cette
+/// page tournée de `turn` degrés dans le sens horaire ; `None` si ce n'est pas un quart
+/// de tour. Le redressement d'une faible inclinaison, lui, est négligé : quelques pixels.
+fn page_rect(
+    img: &DynamicImage,
+    (x, y, w, h): (u32, u32, u32, u32),
+    turn: Option<u16>,
+) -> Option<[f32; 4]> {
+    let (width, height) = (img.width().max(1) as f32, img.height().max(1) as f32);
+    let (x0, y0) = ((x as f32 / width).min(1.0), (y as f32 / height).min(1.0));
+    let x1 = ((x + w) as f32 / width).min(1.0);
+    let y1 = ((y + h) as f32 / height).min(1.0);
+    let back = |fx: f32, fy: f32| match turn {
+        Some(90) => Some((fy, 1.0 - fx)),
+        Some(180) => Some((1.0 - fx, 1.0 - fy)),
+        Some(270) => Some((1.0 - fy, fx)),
+        Some(0) => Some((fx, fy)),
+        _ => None,
+    };
+    let (a, b) = (back(x0, y0)?, back(x1, y1)?);
+    Some([a.0.min(b.0), a.1.min(b.1), a.0.max(b.0), a.1.max(b.1)])
+}
+
+/// Le titulaire du chemin image, collages de l'OCR redressés ; `under_its_label` dit s'il
+/// peut se chercher sous son libellé.
+fn zoom_and_extract_account_holder_traced(
     img: &DynamicImage,
     text_lines: Vec<TextLine>,
     name: &str,
+    provenance: &mut Provenance,
+    turn: Option<u16>,
+    under_its_label: bool,
 ) -> Option<String> {
-    let code_postal_line_regex = Regex::new(r"[[:space:]]*\d{5}\s+[[:alpha:]]").unwrap();
+    find_account_holder(img, text_lines, name, provenance, turn, under_its_label)
+        .map(|h| unglue(&h))
+}
+
+/// Le titulaire imprimé sous son libellé (`under_label`), son bloc tracé.
+fn holder_under_label(
+    img: &DynamicImage,
+    text_lines: &[TextLine],
+    provenance: &mut Provenance,
+    turn: Option<u16>,
+) -> Option<String> {
+    let (holder, mask) = under_label(text_lines)?;
+    provenance.holder_blocks.push(HolderBlock {
+        rect: page_rect(img, mask, turn),
+        outcome: BlockOutcome::Kept,
+    });
+    Some(holder)
+}
+
+/// Redresse, ligne à ligne, deux collages que PP-OCR fait sur les titulaires : le numéro
+/// de voie collé à son type (« 3RUE », « 14ALLEE », « 2BISRUE »), et la civilité de
+/// couple dont l'espace a sauté (« MOU MME »). Le découpage des mots ne sépare un nombre
+/// de ce qui le suit qu'à partir de deux chiffres — « 2A », « 1ER » ne sont pas des
+/// frontières — ; ici, le mot qui suit est un type de voie connu, en tête de ligne.
+fn unglue(holder: &str) -> String {
+    let street = Regex::new(
+        r"(?i)^(\s*\d{1,4}(?:\s?(?:BIS|TER))?)(RUE|AVENUE|AV|ALLEES?|BD|BOULEVARD|CHEMIN|IMPASSE|IMP|PLACE|ROUTE|RTE|QUAI|COURS|SQUARE|RESIDENCE|LOTISSEMENT|CHAUSSEE|FAUBOURG|PASSAGE|HAMEAU|CITE|DOMAINE|SENTIER|VOIE|PROMENADE|ESPLANADE|PARVIS|MONTEE|VILLA|CLOS|LIEU)\b",
+    )
+    .unwrap();
+    let couple = Regex::new(r"(?i)^(\s*)M\.?OU\s+(MME|MADAME|MLLE|MELLE)\b").unwrap();
+
+    holder
+        .lines()
+        .map(|line| {
+            let line = street.replace(line, "$1 $2");
+            couple.replace(&line, "${1}M OU $2").into_owned()
+        })
+        .collect::<Vec<String>>()
+        .join("\n")
+}
+
+fn find_account_holder(
+    img: &DynamicImage,
+    text_lines: Vec<TextLine>,
+    name: &str,
+    provenance: &mut Provenance,
+    turn: Option<u16>,
+    under_its_label: bool,
+) -> Option<String> {
+    provenance.holder_blocks.clear();
+    let block = |mask: (u32, u32, u32, u32), outcome: BlockOutcome| HolderBlock {
+        rect: page_rect(img, mask, turn),
+        outcome,
+    };
+    // Le code postal peut être collé à la ville — « 44800ST HERBLAIN » — selon le
+    // moteur et l'image ; l'espace n'est pas garanti. Le chemin texte le tolère déjà,
+    // le chemin image l'exigeait, et perdait alors toute ancre de titulaire.
+    let code_postal_line_regex = Regex::new(r"[[:space:]]*\d{5}\s*[[:alpha:]]").unwrap();
     let code_postal_word_regex = Regex::new(r"^\d{5}").unwrap();
 
-    fn match_civilite(s: &str) -> bool {
-        let civilite =
-            Regex::new(r"(?i)(^|\s)(m|monsieur|mr|mademoiselle|ml|mle|mlle|melle|madame|mme)\.?\s")
-                .unwrap();
-        let prenom_nom_ou =
-            Regex::new(r"[[:upper:]]+ +[[:upper:]]+ +OU +[[:upper:]]+ +[[:upper:]]+").unwrap();
-
-        civilite.is_match(s) || prenom_nom_ou.is_match(s)
-    }
-
-    fn find_civilite(s: &str) -> Option<usize> {
-        let civilite =
-            Regex::new(r"(?i)(^|\s)(m|monsieur|mr|mademoiselle|ml|mle|mlle|melle|madame|mme)\.?\s")
-                .unwrap();
-        let prenom_nom_ou =
-            Regex::new(r"[[:upper:]]+ +[[:upper:]]+ +OU +[[:upper:]]+ +[[:upper:]]+").unwrap();
-        if civilite.is_match(s) {
-            civilite.find(s).map(|m| m.start())
-        } else if prenom_nom_ou.is_match(s) {
-            prenom_nom_ou.find(s).map(|m| m.start())
-        } else {
-            None
-        }
-    }
+    // la géométrie des lignes lues, pour la trace : une ligne de code postal écartée
+    // pour sa hauteur explique un titulaire qu'aucun bloc n'a jamais couvert
+    let max_height = max_line_height(&text_lines);
+    provenance.ocr_lines = text_lines
+        .iter()
+        .map(|line| {
+            let r = line.bounding_rect();
+            let mask = (
+                r.left().max(0) as u32,
+                r.top().max(0) as u32,
+                r.width().max(0) as u32,
+                r.height().max(0) as u32,
+            );
+            OcrLine {
+                rect: page_rect(img, mask, turn),
+                postal: code_postal_line_regex.is_match(&line.to_string())
+                    && line
+                        .words()
+                        .any(|w| code_postal_word_regex.is_match(&w.to_string())),
+                oversized: r.height() > max_height,
+            }
+        })
+        .collect();
 
     let postal_anchors = extract_anchors(
-        text_lines,
+        text_lines.clone(),
         &code_postal_word_regex,
         Some(&code_postal_line_regex),
     );
 
-    let account_holders = postal_anchors
+    // Un bloc adressé n'est pas forcément le titulaire : l'agence de domiciliation a
+    // elle aussi un code postal. Le chemin texte s'en protège en classant chaque bloc
+    // par son contexte ; ici, rien ne le faisait — et le recadrage aligné à droite,
+    // tenté faute de civilité, décale la fenêtre vers la gauche jusqu'à happer le nom du
+    // titulaire voisin, qui se retrouve collé à l'adresse de l'agence.
+    let domiciliation = Regex::new(r"(?i)(domiciliation|agence|cadre r[ée]serv[ée])").unwrap();
+    // « bénéficiaire » : certains RIB étiquettent le bloc « Nom et adresse du
+    // bénéficiaire » — même rôle que « titulaire », mesuré sur les corpus réels
+    let holder_label =
+        Regex::new(r"(?i)(titulaire|intitul[ée]|account owner|b[ée]n[ée]ficiaire)").unwrap();
+
+    // Le recadrage est un vrai zoom : sur les photos, la reconnaissance rapprochée lit
+    // les petits caractères que la passe pleine page rate. Lire le bloc dans les lignes
+    // de la page au lieu de recadrer a été mesuré — moins vingt points de titulaire.
+    let read_mask = |index: usize, mask: (u32, u32, u32, u32), suffix: &str| -> String {
+        let cropped_img = crop(img, mask, name, &format!("{}_{}", index, suffix));
+        image_to_string(cropped_img)
+    };
+
+    // Chaque code postal détecté coûtait jusqu'à deux recadrages reconnus — jusqu'à
+    // douze appels OCR sur un document dense en codes postaux (agence, mentions,
+    // cachet), pour un seul bloc utile. La lecture pleine page, déjà en main, permet de
+    // trier avant de payer : les codes postaux dont le voisinage se présente comme une
+    // domiciliation sont écartés d'emblée, ceux dont le voisinage porte une civilité ou
+    // un libellé de titulaire passent en premier, et l'examen s'arrête au premier bloc
+    // convaincant.
+    provenance.postal_anchors = postal_anchors.len() as u32;
+    let page_lines: Vec<String> = text_lines.iter().map(|l| l.to_string()).collect();
+
+    let scored: Vec<(usize, &Anchor, i32)> = postal_anchors
         .iter()
         .enumerate()
         .map(|(index, anchor)| {
-            let cropped_img = crop(
-                img,
-                anchor.addr_mask(),
-                name,
-                &format!(r#"{}_addr_mask"#, index),
-            );
-            (
-                index,
-                image_to_string_using_ocrs(engine, cropped_img),
-                anchor,
-            )
-        })
-        .filter_map(|(index, text, anchor)| {
-            if match_civilite(&text) {
-                Some(text)
+            let around = text_in_mask(&text_lines, anchor.addr_mask());
+            let score = if holder_label.is_match(&around) {
+                2
+            } else if match_civilite(&around) {
+                1
+            } else if domiciliation.is_match(&around) {
+                -1
             } else {
-                let cropped_img = crop(
-                    img,
-                    anchor.right_align_addr_mask(),
-                    name,
-                    &format!(r#"{}_right_align_addr_mask"#, index),
-                );
-                let new_text = image_to_string_using_ocrs(engine, cropped_img);
+                0
+            };
+            (index, anchor, score)
+        })
+        .collect();
+    for (_, anchor, score) in &scored {
+        if *score < 0 {
+            let skipped = block(anchor.addr_mask(), BlockOutcome::SkippedAsDomiciliation);
+            provenance.holder_blocks.push(skipped);
+        }
+    }
+    let mut ranked: Vec<(usize, &Anchor, i32)> = scored
+        .into_iter()
+        .filter(|(_, _, score)| *score >= 0)
+        .collect();
+    ranked.sort_by_key(|(_, _, score)| -*score);
+    provenance.holder_candidates = ranked.len() as u32;
 
-                if match_civilite(&new_text) {
-                    Some(new_text)
+    // Les blocs d'adresse reconstruits ligne à ligne : bornés par la page elle-même, pas
+    // par un multiple du code postal. Le choix du code postal reste celui d'en dessous —
+    // son voisinage (libellé, domiciliation) choisit mieux que l'ordre de la page.
+    let segments = segments(&text_lines);
+    let address_blocks = address_blocks(&segments);
+    let block_of = |anchor: &Anchor| {
+        let (cx, cy) = (
+            ((anchor.top_left.x + anchor.bottom_right.x) / 2) as i32,
+            ((anchor.top_left.y + anchor.bottom_right.y) / 2) as i32,
+        );
+        address_blocks.iter().find(|b| {
+            let s = &segments[b.members[0]];
+            b.postal && b.is_holder_like() && cx >= s.x0 && cx <= s.x1 && cy >= s.y0 && cy <= s.y1
+        })
+    };
+
+    // chaque titulaire recevable, avec l'indice de son bloc dans la trace
+    let mut account_holders: Vec<(String, usize)> = Vec::new();
+    let mut designated_above: Vec<(usize, &Anchor, u32)> = Vec::new();
+    for (index, anchor, score) in ranked {
+        provenance.holder_blocks_read += 1;
+        // le code postal ferme un bloc d'adresse désigné : on relit ce bloc, borné par
+        // la page, et lui seul
+        if let Some(address_block) = block_of(anchor) {
+            let mask = read_rect(address_block, &segments);
+            let text = read_address_block(
+                img,
+                around(mask, address_block.line),
+                mask,
+                name,
+                &format!("{}_address_block", index),
+            );
+            if domiciliation.is_match(&text) && !holder_label.is_match(&text) {
+                provenance
+                    .holder_blocks
+                    .push(block(mask, BlockOutcome::Domiciliation));
+                continue;
+            }
+            match trim_holder(&text, &code_postal_line_regex)
+                .map(|h| respace_from_page(&complete_cut_words(&h, &page_lines), &page_lines))
+            {
+                Some(holder) => {
+                    let labelled = holder_label.is_match(&holder);
+                    account_holders.push((holder, provenance.holder_blocks.len()));
+                    provenance
+                        .holder_blocks
+                        .push(block(mask, BlockOutcome::Outranked));
+                    if labelled || score >= 1 {
+                        break;
+                    }
+                    continue;
+                }
+                // relu de travers : le recadrage d'en dessous a encore sa chance
+                None => provenance
+                    .holder_blocks
+                    .push(block(mask, BlockOutcome::Trimmed)),
+            }
+        }
+        let addr_mask = anchor.addr_mask();
+        // la colonne voisine, au-delà d'une gouttière, n'est pas le titulaire
+        let text = match column_span(img, anchor) {
+            Some(span) => {
+                let cropped = crop(img, addr_mask, name, &format!("{}_addr_mask", index));
+                words_between(&cropped, addr_mask.0, span)
+            }
+            None => read_mask(index, addr_mask, "addr_mask"),
+        };
+        // un bloc qui se présente comme domiciliation ne devient pas titulaire, même
+        // en le recadrant autrement
+        if domiciliation.is_match(&text) && !holder_label.is_match(&text) {
+            let rejected = block(addr_mask, BlockOutcome::Domiciliation);
+            provenance.holder_blocks.push(rejected);
+            continue;
+        }
+        // Un bloc porteur du libellé de titulaire est désigné par le document même sans
+        // civilité — le cas de toute personne morale ; `trim_holder` sait s'y ancrer.
+        let (text, mask, refusal) = if match_civilite(&text) || holder_label.is_match(&text) {
+            (Some(text), addr_mask, BlockOutcome::Trimmed)
+        } else {
+            let right_mask = anchor.right_align_addr_mask();
+            let new_text = read_mask(index, right_mask, "right_align_addr_mask");
+            if (match_civilite(&new_text) || holder_label.is_match(&new_text))
+                && !domiciliation.is_match(&new_text)
+            {
+                (Some(new_text), right_mask, BlockOutcome::Trimmed)
+            } else if let Some(label) = side_label(&text_lines, anchor, &holder_label) {
+                // Libellé à gauche, titulaire aligné à droite sur les mêmes lignes : le
+                // libellé sort des deux recadrages, et rien d'autre ne désigne le bloc
+                // d'une personne morale sans forme juridique. Il en donne pourtant la
+                // première ligne : on recadre de sa hauteur jusqu'au code postal, ce
+                // qui laisse dehors la date et le numéro d'agence posés au-dessus, et
+                // on lit ce recadrage comme étiqueté.
+                let mask = side_mask(anchor, label);
+                let side = read_mask(index, mask, "side_label_mask");
+                if domiciliation.is_match(&side) {
+                    (None, mask, BlockOutcome::Domiciliation)
                 } else {
-                    None
+                    (
+                        Some(format!("Titulaire\n{}", side)),
+                        mask,
+                        BlockOutcome::Trimmed,
+                    )
+                }
+            } else {
+                // désigné plus haut que le masque : relu seulement si aucun autre code
+                // postal ne donne le titulaire — une lecture de plus, sinon, sur chaque
+                // bloc écarté de la page
+                if let Some(top) =
+                    designation_above(&segments, anchor, &holder_label, &code_postal_line_regex)
+                {
+                    designated_above.push((index, anchor, top));
+                }
+                (None, addr_mask, BlockOutcome::NotDesignated)
+            }
+        };
+        match text
+            .and_then(|t| trim_holder(&t, &code_postal_line_regex))
+            .map(|h| respace_from_page(&complete_cut_words(&h, &page_lines), &page_lines))
+        {
+            Some(holder) => {
+                let labelled = holder_label.is_match(&holder);
+                account_holders.push((holder, provenance.holder_blocks.len()));
+                provenance
+                    .holder_blocks
+                    .push(block(mask, BlockOutcome::Outranked));
+                // le premier bloc porteur d'un libellé — ou le premier tout court quand la
+                // page n'en désigne aucun — suffit : inutile de reconnaître les suivants
+                if labelled || score >= 1 {
+                    break;
                 }
             }
-        })
-        .map(|text| {
-            // on supprime tout ce qui se situe avant civilite
-            let start = find_civilite(&text).unwrap();
-            let text = text[start..].trim().to_string();
+            None => provenance.holder_blocks.push(block(mask, refusal)),
+        }
+    }
+    // Aucun code postal n'a donné de titulaire : ceux dont la désignation est restée
+    // au-dessus du masque sont relus, remontés jusqu'à elle.
+    if account_holders.is_empty() {
+        for (index, anchor, top) in designated_above {
+            let mask = above_mask(anchor, top);
+            let text = read_mask(index, mask, "above_mask");
+            if domiciliation.is_match(&text) && !holder_label.is_match(&text) {
+                provenance
+                    .holder_blocks
+                    .push(block(mask, BlockOutcome::Domiciliation));
+                continue;
+            }
+            match trim_holder(&text, &code_postal_line_regex)
+                .map(|h| respace_from_page(&complete_cut_words(&h, &page_lines), &page_lines))
+            {
+                Some(holder) => {
+                    account_holders.push((holder, provenance.holder_blocks.len()));
+                    provenance
+                        .holder_blocks
+                        .push(block(mask, BlockOutcome::Outranked));
+                    break;
+                }
+                None => provenance
+                    .holder_blocks
+                    .push(block(mask, BlockOutcome::Trimmed)),
+            }
+        }
+    }
+    // à plusieurs candidats, celui qui porte un libellé de titulaire l'emporte
+    account_holders.sort_by_key(|(text, _)| !holder_label.is_match(text));
 
-            // on supprime toutes les lignes situées après le code postal
-            let lines: Vec<&str> = text.lines().collect();
-            let code_postal_index = lines
-                .iter()
-                .position(|line| code_postal_line_regex.is_match(line))
-                .unwrap();
-            lines[..code_postal_index + 1].join("\n")
-        })
-        .collect::<Vec<String>>();
-
-    let account_holder = account_holders.first().map(|s| {
-        s.lines()
-            .map(|l| l.to_string())
-            .collect::<Vec<String>>()
-            .join("\n")
-    });
-
-    if account_holder.is_some() {
-        return account_holder;
+    // `s` porte déjà ses sauts de ligne : les recollecter caractère à caractère
+    // aplatirait le titulaire en une seule ligne
+    if let Some((holder, kept)) = account_holders.into_iter().next() {
+        provenance.holder_blocks[kept].outcome = BlockOutcome::Kept;
+        return Some(holder);
     }
 
-    let account_holder_word_regex = Regex::new(r"(?i)titulaire").unwrap();
-    let (_, _text_lines, account_holder_anchors) =
-        ocrs_anchors(engine, img, &account_holder_word_regex, None);
+    // Aucun code postal n'a mené au titulaire — souvent parce qu'il n'a pas été lu :
+    // une civilité fait alors son bloc en descendant, jusqu'à un blanc.
+    let civility_blocks = address_blocks
+        .iter()
+        .filter(|b| !b.postal && b.is_holder_like());
+    for (index, address_block) in civility_blocks.enumerate() {
+        let mask = read_rect(address_block, &segments);
+        let text = read_address_block(
+            img,
+            around(mask, address_block.line),
+            mask,
+            name,
+            &format!("{}_civility_block", index),
+        );
+        if domiciliation.is_match(&text) && !holder_label.is_match(&text) {
+            provenance
+                .holder_blocks
+                .push(block(mask, BlockOutcome::Domiciliation));
+            continue;
+        }
+        match trim_holder(&text, &code_postal_line_regex)
+            .map(|h| respace_from_page(&complete_cut_words(&h, &page_lines), &page_lines))
+        {
+            Some(holder) => {
+                provenance
+                    .holder_blocks
+                    .push(block(mask, BlockOutcome::Kept));
+                return Some(holder);
+            }
+            None => provenance
+                .holder_blocks
+                .push(block(mask, BlockOutcome::Trimmed)),
+        }
+    }
 
-    account_holder_anchors
+    // Le mot « titulaire » se cherche dans les lignes déjà reconnues : relancer la
+    // reconnaissance de la page entière pour l'y trouver coûtait un appel complet.
+    // « bénéficiaire » n'entre pas dans ce repli : mesuré, le masque à compte de lignes
+    // fixe rend des blocs tronqués sur ces mises en page — pire que rien
+    let account_holder_word_regex = Regex::new(r"(?i)titulaire").unwrap();
+    let account_holder_anchors =
+        extract_anchors(text_lines.clone(), &account_holder_word_regex, None);
+
+    for (index, anchor) in account_holder_anchors.iter().enumerate() {
+        let mask = anchor.account_holder_mask();
+        let cropped_img = crop(
+            img,
+            mask,
+            name,
+            &format!(r#"{}_account_holder_mask"#, index),
+        );
+        let text = image_to_string(cropped_img);
+        let holder = account_holder_word_regex
+            .is_match(&text)
+            .then(|| find_simple_account_holder(&text, 1))
+            .flatten();
+        let outcome = if holder.is_some() {
+            BlockOutcome::Kept
+        } else {
+            BlockOutcome::NotDesignated
+        };
+        provenance.holder_blocks.push(block(mask, outcome));
+        if holder.is_some() {
+            return holder;
+        }
+    }
+
+    // Ni code postal ni civilité, mais un libellé seul sur sa ligne, le titulaire en
+    // dessous : la mise en page des applications et des RIB en ligne.
+    if under_its_label {
+        if let Some(holder) = holder_under_label(img, &text_lines, provenance, turn) {
+            return Some(holder);
+        }
+    }
+
+    // Dernier recours : ni code postal ni libellé autour du titulaire — le RIB n'imprime
+    // que le nom, sans adresse (« M OU MME DUPONT JEAN » sous le BIC). Aucune ancre ne
+    // le désignait. La ligne de la page qui commence par une civilité est le titulaire ;
+    // le chemin texte a le même recours.
+    let line = civility_line(&text_lines)?;
+    let r = line.bounding_rect();
+    let mask = (
+        r.left().max(0) as u32,
+        r.top().max(0) as u32,
+        r.width().max(0) as u32,
+        r.height().max(0) as u32,
+    );
+    provenance
+        .holder_blocks
+        .push(block(mask, BlockOutcome::Kept));
+    Some(line.to_string().trim().to_string())
+}
+
+/// Lit le recadrage `cropped`, pris à l'abscisse `crop_x` de la page, comme d'habitude,
+/// puis écarte les morceaux de ligne tout entiers au-delà des abscisses `span` de la
+/// page. La reconnaissance reste celle du recadrage : sur les photos, un recadrage plus
+/// serré se lisait moins bien ; la gouttière ne fait que trier.
+///
+/// On écarte des morceaux — les mots d'une ligne coupés aux grands blancs —, pas des
+/// mots : la gouttière se mesure sur les lignes du code postal, et un nom plus long que
+/// son adresse la traverse ; mot à mot, il perdait son début (« M OU » de
+/// « M OU MME … »). Une ligne qui franchit la gouttière sans blanc n'est pas une autre
+/// colonne.
+fn words_between(cropped: &DynamicImage, crop_x: u32, (lo, hi): (u32, u32)) -> String {
+    let (lo, hi) = (lo as i32 - crop_x as i32, hi as i32 - crop_x as i32);
+
+    recognize(cropped)
+        .iter()
+        .filter_map(|line| {
+            let kept: Vec<String> = segments(std::slice::from_ref(line))
+                .into_iter()
+                .filter(|s| s.x1 >= lo && s.x0 <= hi)
+                .map(|s| s.text)
+                .collect();
+            (!kept.is_empty()).then(|| kept.join(" "))
+        })
+        // les détections parasites d'un caractère ne font pas une ligne
+        .filter(|l| l.len() > 1)
+        .collect::<Vec<String>>()
+        .join("\n")
+}
+
+/// Relit un bloc d'adresse sans recadrage serré : PP-OCR lit moins bien un texte collé
+/// au bord — sur les photos, un recadrage au ras du bloc dédoublait une ligne ou
+/// faussait le nom. On lit le recadrage large d'en dessous, étendu au bloc, et on ne
+/// garde que les mots du bloc.
+fn read_address_block(
+    img: &DynamicImage,
+    wide: (u32, u32, u32, u32),
+    block: (u32, u32, u32, u32),
+    name: &str,
+    suffix: &str,
+) -> String {
+    let (x, y) = (wide.0.min(block.0), wide.1.min(block.1));
+    let right = (wide.0 + wide.2).max(block.0 + block.2);
+    let bottom = (wide.1 + wide.3).max(block.1 + block.3);
+    let cropped = crop(img, (x, y, right - x, bottom - y), name, suffix);
+    words_inside(&cropped, (x, y), block)
+}
+
+/// Le rectangle élargi d'une ligne et demie de chaque côté : assez de contexte pour la
+/// reconnaissance, encore assez près pour un vrai zoom.
+fn around((x, y, w, h): (u32, u32, u32, u32), line: i32) -> (u32, u32, u32, u32) {
+    let margin = (line.max(1) as u32) * 3 / 2;
+    let (x0, y0) = (x.saturating_sub(margin), y.saturating_sub(margin));
+    (x0, y0, x + w + margin - x0, y + h + margin - y0)
+}
+
+/// Lit le recadrage `cropped`, pris en `origin` dans la page, et ne garde que les mots
+/// dont le centre tombe dans le rectangle `keep` (x, y, largeur, hauteur) de la page.
+fn words_inside(
+    cropped: &DynamicImage,
+    (ox, oy): (u32, u32),
+    (kx, ky, kw, kh): (u32, u32, u32, u32),
+) -> String {
+    let (x0, y0) = (kx as i64 - ox as i64, ky as i64 - oy as i64);
+    let (x1, y1) = (x0 + kw as i64, y0 + kh as i64);
+    let inside = |r: crate::lines::Rect| {
+        let cx = ((r.left() + r.right()) / 2) as i64;
+        let cy = ((r.top() + r.bottom()) / 2) as i64;
+        cx >= x0 && cx <= x1 && cy >= y0 && cy <= y1
+    };
+
+    recognize(cropped)
+        .iter()
+        .filter_map(|line| {
+            let kept: Vec<String> = line
+                .words()
+                .filter(|w| inside(w.bounding_rect()))
+                .map(|w| w.to_string())
+                .collect();
+            (!kept.is_empty()).then(|| kept.join(" "))
+        })
+        // les détections parasites d'un caractère ne font pas une ligne
+        .filter(|l| l.len() > 1)
+        .collect::<Vec<String>>()
+        .join("\n")
+}
+
+/// Première ligne de la page, de haut en bas, qui commence par une civilité suivie d'un
+/// nom : « M DUPONT », « MME DUPONT », « M OU MME DUPONT », « M.OU MME DUPONT ». Un mot
+/// qui commence comme une civilité (« MONTANT », « Mode de paiement ») n'en est pas une.
+fn civility_line(text_lines: &[TextLine]) -> Option<&TextLine> {
+    let civility = Regex::new(
+        r"(?i)^\s*(m|mr|monsieur|mme|madame|mlle|mle|melle|mademoiselle)(\.\s*|\s+)(ou\s+(m|mr|mme|madame|monsieur)\.?\s+)?[[:alpha:]]{2,}",
+    )
+    .unwrap();
+
+    let mut lines: Vec<&TextLine> = text_lines.iter().collect();
+    lines.sort_by_key(|l| l.bounding_rect().top());
+    lines
+        .into_iter()
+        .find(|l| civility.is_match(&l.to_string()))
+}
+
+/// Le titulaire imprimé sous son libellé, seul sur sa ligne — « Bénéficiaire »,
+/// « Beneficiary », « Titulaire du compte » —, sans civilité ni adresse : la mise en page
+/// des applications bancaires et des RIB en ligne (« Bénéficiaire / Prénom Nom / IBAN »).
+/// Ce sont les lignes juste en dessous, dans la colonne du libellé, jusqu'au libellé
+/// suivant — un nom de champ, ou une ligne qui finit par deux-points — ou à un blanc, une
+/// ligne de code postal fermant le bloc — ou, lu seul, le code postal puis sa ville ;
+/// quatre au plus, la ville en sus, rendues avec leur rectangle. Une
+/// ligne que l'OCR a lue en morceaux sur la même rangée est recollée, de gauche à droite.
+fn under_label(text_lines: &[TextLine]) -> Option<(String, (u32, u32, u32, u32))> {
+    const MAX_LINES: usize = 4;
+    let label = Regex::new(
+        r"(?i)^\s*(nom\s+(et\s+adresse\s+)?du\s+)?(b[ée]n[ée]ficiaire|beneficiary|titulaire(\s+du\s+compte)?|intitul[ée]\s+du\s+compte|account\s+(holder|owner|name))\s*:?\s*$",
+    )
+    .unwrap();
+    let next_field = Regex::new(
+        r"(?i)^\s*(iban|bic|rib|swift|banque|bank|domiciliation|agence|code|num[ée]ro|n[°o]|compte|devise|cl[ée]|adresse|address|r[ée]f[ée]rence|libell[ée])\b|:\s*$",
+    )
+    .unwrap();
+    let postal_line = Regex::new(r"^\s*\d{2}\s?\d{3}\b").unwrap();
+
+    let mut lines: Vec<&TextLine> = text_lines.iter().collect();
+    lines.sort_by_key(|l| l.bounding_rect().top());
+
+    // la rangée qui commence au morceau `start` : les morceaux à sa hauteur qui le
+    // prolongent à droite sans le chevaucher — sur une photo de travers, la ligne du
+    // dessous, qui part du même bord, n'en est pas un —, à moins de quatre hauteurs l'un
+    // de l'autre
+    let row = |start: &TextLine| -> (String, crate::lines::Rect) {
+        let r = start.bounding_rect();
+        let h = r.height().max(1);
+        let center = |r: &crate::lines::Rect| r.top() + r.height() / 2;
+        let mut parts: Vec<(crate::lines::Rect, String)> = lines
+            .iter()
+            .map(|l| (l.bounding_rect(), l.to_string().trim().to_string()))
+            .filter(|(s, _)| (center(s) - center(&r)).abs() <= h / 2 && s.left() >= r.left())
+            .collect();
+        parts.sort_by_key(|(s, _)| s.left());
+        let (mut text, mut right, mut bottom) = (String::new(), r.left(), r.bottom());
+        for (s, part) in parts {
+            if !text.is_empty() && s.left() < right - h / 2 {
+                continue;
+            }
+            if !text.is_empty() && s.left() - right > 4 * h {
+                break;
+            }
+            if !text.is_empty() {
+                text.push(' ');
+            }
+            text.push_str(&part);
+            right = right.max(s.right());
+            bottom = bottom.max(s.bottom());
+        }
+        let rect =
+            crate::lines::Rect::from_tlhw(r.top(), r.left(), bottom - r.top(), right - r.left());
+        (text, rect)
+    };
+
+    for (i, label_line) in lines.iter().enumerate() {
+        if !label.is_match(&label_line.to_string()) {
+            continue;
+        }
+        let l = label_line.bounding_rect();
+        let h = l.height().max(1);
+        // dans la colonne du libellé : sous lui, ou partant du même bord gauche
+        let in_column = |r: &crate::lines::Rect| {
+            (r.left() < l.right() && r.right() > l.left()) || (r.left() - l.left()).abs() <= 2 * h
+        };
+
+        let mut taken: Vec<crate::lines::Rect> = vec![];
+        let mut texts: Vec<String> = vec![];
+        let mut bottom = l.bottom();
+        // le code postal lu seul sur sa ligne : la ville suit, et ferme le bloc
+        let mut town_next = false;
+        for line in lines[i + 1..].iter() {
+            let r = line.bounding_rect();
+            if r.top() < l.top() + h / 2 || !in_column(&r) {
+                continue;
+            }
+            let (text, r) = row(line);
+            let digits = text.chars().filter(|c| c.is_ascii_digit()).count();
+            let letters = text.chars().filter(|c| c.is_alphabetic()).count();
+            let postal = postal_line.is_match(&text) && !texts.is_empty() && !town_next;
+            // un trait de séparation peut écarter le nom de son libellé, pas ses lignes
+            // l'une de l'autre
+            let gap = if texts.is_empty() { 3 * h } else { 3 * h / 2 };
+            if r.top() - bottom > gap
+                || next_field.is_match(&text)
+                || label.is_match(&text)
+                || (is_label_or_noise(&text) && !postal)
+                || (digits >= 5 && !postal)
+                || (letters < 2 && !postal)
+                || (town_next && digits > 0)
+            {
+                break;
+            }
+            bottom = r.bottom();
+            taken.push(r);
+            texts.push(text);
+            if town_next || (postal && letters >= 2) {
+                break;
+            }
+            town_next = postal;
+            if texts.len() == MAX_LINES && !town_next {
+                break;
+            }
+        }
+        if texts.is_empty() {
+            continue;
+        }
+
+        let left = taken.iter().map(|r| r.left()).min()?.max(0);
+        let top = taken.iter().map(|r| r.top()).min()?.max(0);
+        let right = taken.iter().map(|r| r.right()).max()?.max(left);
+        let bottom = taken.iter().map(|r| r.bottom()).max()?.max(top);
+        let mask = (
+            left as u32,
+            top as u32,
+            (right - left) as u32,
+            (bottom - top) as u32,
+        );
+        return Some((texts.join("\n"), mask));
+    }
+    None
+}
+
+/// Restreint un bloc reconnu au titulaire : on écarte ce qui précède la civilité — ou le
+/// libellé (« titulaire », « bénéficiaire »…) quand la civilité manque —, et ce qui suit
+/// le code postal.
+///
+/// Le libellé fait ancre à part entière : un bloc « Nom et adresse du bénéficiaire »
+/// n'a souvent pas de civilité, et l'exiger perdait le titulaire alors que le document
+/// le désigne explicitement. Ce qui suit le libellé — sur sa ligne, sinon les lignes
+/// d'en dessous — est le bloc.
+///
+/// Le code postal peut manquer alors qu'une civilité est présente — le recadrage aligné à
+/// droite décale la fenêtre et peut le laisser hors champ, et l'OCR ne le restitue pas
+/// toujours sous une forme reconnaissable. Dans ce cas on conserve le bloc, borné par la
+/// hauteur du recadrage, plutôt que d'abandonner.
+fn trim_holder(text: &str, postal_code: &Regex) -> Option<String> {
+    // Une civilité avant le libellé est un faux positif — un « M » isolé dans le texte
+    // de banque au-dessus suffit — et ferait déborder le bloc vers le haut : le libellé
+    // prime alors. Après le libellé, la civilité est dans le bloc : elle reste l'ancre,
+    // au plus près du nom.
+    let (civility, label) = (find_civilite(text), after_holder_label(text));
+    let start = match (civility, label) {
+        (Some(civility), Some(label)) => Some(civility.max(label)),
+        (civility, label) => civility.or(label),
+    }?;
+    let start = if Some(start) == civility {
+        care_of_start(text, start, label.unwrap_or(0))
+    } else {
+        start
+    };
+    let text = text[start..].trim();
+
+    if text.is_empty() {
+        return None;
+    }
+
+    let lines: Vec<&str> = text.lines().collect();
+    let postal = lines.iter().position(|line| postal_code.is_match(line));
+    let end = postal.map_or(lines.len(), |index| index + 1);
+
+    // Ancré sur le seul libellé — sans civilité pour confirmer que c'est bien un nom —
+    // un bloc qui ne va pas jusqu'à son code postal est douteux : probablement coupé,
+    // ou pas un titulaire. Ne rien rendre plutôt qu'un bloc douteux.
+    if !match_civilite(text) && postal.is_none() {
+        return None;
+    }
+
+    let kept: Vec<&str> = lines[..end]
+        .iter()
+        .copied()
+        .filter(|line| !is_label_or_noise(line))
+        .collect();
+
+    (!kept.is_empty()).then(|| kept.join("\n"))
+}
+
+/// « CHEZ M. DUPONT » : la civilité est celle de l'hébergeant, le titulaire est la ligne
+/// du dessus. Le bloc commence alors à cette ligne — jamais au-dessus du libellé
+/// (`floor`) —, sinon à la civilité.
+fn care_of_start(text: &str, civility: usize, floor: usize) -> usize {
+    let care_of = Regex::new(r"(?i)(^|\s)(chez|c/o)\s*$").unwrap();
+    // `civility` pointe sur l'espace qui précède la civilité, ou sur le début de ligne
+    let civility_word = civility + text[civility..].len() - text[civility..].trim_start().len();
+    let line_start = text[..civility_word].rfind('\n').map_or(0, |i| i + 1);
+    if !care_of.is_match(&text[line_start..civility_word]) {
+        return civility;
+    }
+    let above = text[..line_start.saturating_sub(1)]
+        .rfind('\n')
+        .map_or(0, |i| i + 1);
+    if line_start == 0 || text[above..line_start].trim().is_empty() {
+        return line_start.max(floor);
+    }
+    above.max(floor)
+}
+
+/// Rétablit les espaces qu'une ligne du titulaire a perdues, d'après la lecture pleine
+/// page.
+///
+/// PP-OCR n'est pas constant sur les espaces d'un recadrage à l'autre : « 12RUE DES NYMPHEAS »,
+/// « RUE DESNYMPHEAS », alors que la page lue entière les sépare. On ne reprend la ligne de la
+/// page que si elle porte exactement les mêmes caractères, avec plus d'espaces, et partout
+/// de la même façon : jamais un caractère ajouté ni retiré, jamais une espace en moins.
+fn respace_from_page(holder: &str, page_lines: &[String]) -> String {
+    holder
+        .lines()
+        .map(|line| {
+            let line = line.trim();
+            let key: Vec<char> = line.chars().filter(|c| !c.is_whitespace()).collect();
+            // une ligne courte se retrouve n'importe où : on n'y touche pas
+            if key.len() < 6 {
+                return line.to_string();
+            }
+            let spaced: Vec<String> = page_lines
+                .iter()
+                .flat_map(|page| spaced_occurrences(page, &key))
+                .collect();
+            match spaced.split_first() {
+                Some((first, rest))
+                    if rest.iter().all(|s| s == first)
+                        && first.split_whitespace().count() > line.split_whitespace().count() =>
+                {
+                    first.clone()
+                }
+                _ => line.to_string(),
+            }
+        })
+        .collect::<Vec<String>>()
+        .join("\n")
+}
+
+/// Chaque passage de `page` qui porte les caractères `key` dans l'ordre, espaces mis à
+/// part, tel qu'il est espacé dans la page.
+fn spaced_occurrences(page: &str, key: &[char]) -> Vec<String> {
+    let chars: Vec<char> = page.chars().collect();
+    let compact: Vec<(usize, char)> = chars
         .iter()
         .enumerate()
-        .map(|(index, anchor)| {
-            let cropped_img = crop(
-                img,
-                anchor.account_holder_mask(),
-                name,
-                &format!(r#"{}_account_holder_mask"#, index),
-            );
-            image_to_string_using_ocrs(engine, cropped_img)
+        .filter(|(_, c)| !c.is_whitespace())
+        .map(|(i, c)| (i, *c))
+        .collect();
+    if key.is_empty() || compact.len() < key.len() {
+        return Vec::new();
+    }
+
+    (0..=compact.len() - key.len())
+        .filter(|&start| {
+            compact[start..start + key.len()]
+                .iter()
+                .map(|(_, c)| c)
+                .eq(key.iter())
         })
-        .filter(|text| account_holder_word_regex.is_match(text))
-        .find_map(|text| find_simple_account_holder(&text, 1))
+        .map(|start| {
+            let (first, last) = (compact[start].0, compact[start + key.len() - 1].0);
+            chars[first..=last].iter().collect()
+        })
+        .collect()
+}
+
+/// Recolle les mots que le bord du recadrage a coupés, d'après la lecture pleine page.
+///
+/// Le masque d'adresse est calé sur la largeur du code postal : assez pour un nom de
+/// personne, pas pour une raison sociale — « ASSOCIATION PALETTE ET PINC »,
+/// « ATION DES AMIS DE ». La page, lue une fois pour toutes, porte souvent la ligne
+/// entière. On ne complète que le premier et le dernier mot d'une ligne, et seulement
+/// quand la ligne se retrouve telle quelle dans la page : jamais de mot ajouté, pour
+/// ne pas happer la colonne voisine.
+fn complete_cut_words(holder: &str, page_lines: &[String]) -> String {
+    holder
+        .lines()
+        .map(|line| {
+            let line = line.trim();
+            // une ligne courte se retrouve n'importe où, au milieu d'autres mots : on
+            // n'y touche pas
+            if line.chars().count() < 8 {
+                return line.to_string();
+            }
+            let is_word = |c: char| c.is_alphanumeric();
+
+            // chaque occurrence, étendue vers la gauche jusqu'au début du mot et vers la
+            // droite jusqu'à sa fin — une ligne d'un RIB imprimé en deux ou trois
+            // exemplaires se retrouve autant de fois
+            let completions: Vec<String> = page_lines
+                .iter()
+                .flat_map(|page| page.match_indices(line).map(move |(at, _)| (page, at)))
+                .map(|(page, at)| {
+                    let start = page[..at]
+                        .char_indices()
+                        .rev()
+                        .take_while(|(_, c)| is_word(*c))
+                        .last()
+                        .map_or(at, |(i, _)| i);
+                    let end = at + line.len();
+                    let stop = page[end..]
+                        .char_indices()
+                        .find(|(_, c)| !is_word(*c))
+                        .map_or(page.len(), |(i, _)| end + i);
+                    page[start..stop].to_string()
+                })
+                .collect();
+
+            // seulement si toutes les occurrences disent la même chose
+            match completions.split_first() {
+                Some((first, rest)) if rest.iter().all(|c| c == first) => first.clone(),
+                _ => line.to_string(),
+            }
+        })
+        .collect::<Vec<String>>()
+        .join("\n")
+}
+
+/// Ligne qui n'appartient pas au titulaire bien qu'elle tombe dans son bloc : un
+/// libellé seul sur sa ligne — la traduction « (Account Owner) », « Adresse : » —, la
+/// rangée de chiffres du RIB, ou le bruit qu'une photo fait lire dans un filet de
+/// tableau (« 2=====k===m=== »).
+pub fn is_label_or_noise(line: &str) -> bool {
+    let label = Regex::new(
+        r"(?i)^\s*\(?\s*(account\s+(holder|owner|name)|adresse|address|rib)\s*\)?\s*:?\s*$",
+    )
+    .unwrap();
+    let digits_only = Regex::new(r"^[\d\s]{12,}$").unwrap();
+
+    let chars: Vec<char> = line.chars().filter(|c| !c.is_whitespace()).collect();
+    let alnum = chars.iter().filter(|c| c.is_alphanumeric()).count();
+    let noisy = !chars.is_empty() && alnum * 2 < chars.len();
+
+    label.is_match(line) || digits_only.is_match(line.trim()) || noisy
 }
 
 fn crop(
@@ -271,30 +1596,581 @@ fn bytes_to_img(content: Vec<u8>) -> Option<DynamicImage> {
     Some(img.into_luma8().into())
 }
 
-fn extract_iban_in_image(
-    lt: &mut LepTess,
-    engine: &OcrEngine,
-    cropped_img: &DynamicImage,
-    name: &str,
-) -> Option<String> {
-    let cropped_img = increase_image_size_if_needed(cropped_img.clone());
-    let png_bytes = encode_png(&cropped_img);
-    let tess_iban = img_to_string_using_tesseract(lt, &png_bytes);
-    if let Some(iban) = extract_iban(&tess_iban) {
+/// Lit l'IBAN dans un recadrage : PP-OCR d'abord, tesseract en repli.
+///
+/// PP-OCR lit ces recadrages plus souvent et bien plus vite que tesseract. Le repli
+/// reste : mesuré sans lui, l'IBAN des photos perd trois documents sur trente-deux,
+/// et un second modèle PP-OCR à sa place n'en récupère qu'un — deux tailles d'un même
+/// modèle partagent leurs erreurs.
+fn extract_iban_in_image(cropped_img: &DynamicImage, name: &str) -> Option<String> {
+    let ocr = image_to_string(cropped_img.clone());
+    if let Some(iban) = extract_iban(&ocr) {
         return Some(iban);
-    };
+    }
 
-    let ocrs_iban = image_to_string_using_ocrs(engine, cropped_img);
-    if let Some(iban) = extract_iban(&ocrs_iban) {
+    let tess = img_to_string_using_tesseract(cropped_img.clone());
+    if let Some(iban) = extract_iban(&tess) {
         return Some(iban);
-    };
+    }
 
-    log::trace!(
-        "not found for {}: tess_iban: {}, ocrs_iban: {}",
-        name,
-        tess_iban,
-        ocrs_iban
-    );
+    log::trace!("not found for {}: {} / {}", name, ocr, tess);
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn postal_code() -> Regex {
+        Regex::new(r"[[:space:]]*\d{5}\s+[[:alpha:]]").unwrap()
+    }
+
+    /// Un RIB fictif scanné tête en bas : PP-OCR le lit sur la page retournée, sans
+    /// attendre tesseract, et le titulaire suit.
+    ///
+    /// Demande les modèles PP-OCR, absents de la CI :
+    ///     cargo test --release -- --ignored a_page_upside_down
+    #[test]
+    #[ignore = "demande les modèles PP-OCR (download-models.sh)"]
+    fn a_page_upside_down_is_read_turned_over() {
+        let pdf = std::fs::read("tests/fixtures/rib/text_layer_without_rib.pdf").unwrap();
+        let page = image::load_from_memory(&crate::file_utils::pdf_to_img_bytes(pdf)).unwrap();
+        let mut png = Vec::new();
+        page.rotate180()
+            .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let mut provenance = Provenance::default();
+
+        let rib = image_bytes_to_rib_traced(png, "upside_down.png", &mut provenance)
+            .expect("le RIB est lu");
+
+        assert_eq!(provenance.engine, Some(Engine::PpOcrPage));
+        assert_eq!(
+            crate::rib::normalize_iban(rib.iban()),
+            "FR7630001000644919009562088"
+        );
+        assert!(rib.account_holder().is_some_and(|h| h.contains("DEGAS")));
+    }
+
+    #[test]
+    fn holder_is_trimmed_around_civility_and_postal_code() {
+        let text =
+            "Titulaire du compte\nM MATISSE HENRI\n51 RUE BERNARD ROY\n44100 NANTES\nDomiciliation";
+
+        assert_eq!(
+            trim_holder(text, &postal_code()).as_deref(),
+            Some("M MATISSE HENRI\n51 RUE BERNARD ROY\n44100 NANTES")
+        );
+    }
+
+    /// Un bloc sans code postal reconnaissable ne doit pas faire tomber l'analyse : le
+    /// recadrage aligné à droite peut le laisser hors champ, et l'OCR ne le restitue pas
+    /// toujours espacé comme attendu.
+    #[test]
+    fn a_holder_without_postal_code_is_kept_whole() {
+        assert_eq!(
+            trim_holder("M MATISSE HENRI\n51 RUE BERNARD ROY", &postal_code()).as_deref(),
+            Some("M MATISSE HENRI\n51 RUE BERNARD ROY")
+        );
+
+        // code postal collé à la ville : le motif ne le reconnaît pas
+        assert_eq!(
+            trim_holder("MME KAHLO FRIDA\n44100NANTES", &postal_code()).as_deref(),
+            Some("MME KAHLO FRIDA\n44100NANTES")
+        );
+    }
+
+    #[test]
+    fn a_block_without_civility_nor_label_is_discarded() {
+        assert_eq!(
+            trim_holder("51 RUE BERNARD ROY\n44100 NANTES", &postal_code()),
+            None
+        );
+    }
+
+    /// Un libellé fait ancre même sans civilité : « Nom et adresse du bénéficiaire »
+    /// désigne le bloc, l'exiger perdait des titulaires explicitement étiquetés.
+    #[test]
+    fn a_labelled_block_without_civility_is_kept() {
+        let text = "Nom et adresse du bénéficiaire\nMATISSE HENRI\n51 RUE BERNARD ROY\n44100 NANTES\nDomiciliation";
+        assert_eq!(
+            trim_holder(text, &postal_code()).as_deref(),
+            Some("MATISSE HENRI\n51 RUE BERNARD ROY\n44100 NANTES")
+        );
+
+        // libellé et titulaire sur la même ligne
+        assert_eq!(
+            trim_holder("Titulaire : MATISSE HENRI\n44100 NANTES", &postal_code()).as_deref(),
+            Some("MATISSE HENRI\n44100 NANTES")
+        );
+
+        // un libellé qui ne désigne rien ne rend rien
+        assert_eq!(trim_holder("Titulaire du compte", &postal_code()), None);
+
+        // sans civilité ni code postal pour le fermer, le bloc est douteux :
+        // probablement coupé, ou pas un titulaire — ne rien rendre
+        assert_eq!(
+            trim_holder(
+                "Nom et adresse du bénéficiaire\nMATISSE HENRI",
+                &postal_code()
+            ),
+            None
+        );
+    }
+
+    /// « M.OU MME » : le point colle les deux civilités, le titulaire les garde toutes
+    /// les deux.
+    #[test]
+    fn a_glued_couple_civility_is_kept_whole() {
+        let text = "BIC : BDFEFRPPCCT\nM.OU MME MONET CLAUDE\n12 RUE DES NYMPHEAS\n27620 GIVERNY";
+        assert_eq!(
+            trim_holder(text, &postal_code()).as_deref(),
+            Some("M.OU MME MONET CLAUDE\n12 RUE DES NYMPHEAS\n27620 GIVERNY")
+        );
+    }
+
+    /// « CHEZ M. … » : la civilité est celle de l'hébergeant, le titulaire est la ligne
+    /// du dessus — sans remonter au-dessus du libellé.
+    #[test]
+    fn a_holder_lodged_care_of_someone_starts_above() {
+        let text = "Domiciliation BDF\nKAHLO FRIDA\nCHEZ M MONET CLAUDE\n12 RUE DES NYMPHEAS\n27620 GIVERNY";
+        assert_eq!(
+            trim_holder(text, &postal_code()).as_deref(),
+            Some("KAHLO FRIDA\nCHEZ M MONET CLAUDE\n12 RUE DES NYMPHEAS\n27620 GIVERNY")
+        );
+
+        let labelled = "Titulaire : KAHLO FRIDA\nCHEZ M MONET CLAUDE\n27620 GIVERNY";
+        assert_eq!(
+            trim_holder(labelled, &postal_code()).as_deref(),
+            Some("KAHLO FRIDA\nCHEZ M MONET CLAUDE\n27620 GIVERNY")
+        );
+
+        // « CHEZ » en tête du bloc, rien au-dessus : on garde la ligne
+        assert_eq!(
+            trim_holder("CHEZ M MONET CLAUDE\n27620 GIVERNY", &postal_code()).as_deref(),
+            Some("CHEZ M MONET CLAUDE\n27620 GIVERNY")
+        );
+    }
+
+    /// Une espace perdue au recadrage est reprise de la page ; jamais un caractère, jamais
+    /// une espace retirée, et rien quand la page hésite.
+    #[test]
+    fn spaces_lost_in_the_crop_are_restored_from_the_page() {
+        let page = vec![
+            "BIC BDFEFRPPCCT".to_string(),
+            "12 RUE DES IRIS".to_string(),
+            "M MONET CLAUDE".to_string(),
+        ];
+        assert_eq!(
+            respace_from_page("M MONET CLAUDE\n12 RUE DESIRIS", &page),
+            "M MONET CLAUDE\n12 RUE DES IRIS"
+        );
+
+        // la page colle plus que le recadrage : on garde le recadrage
+        let glued = vec!["12 RUEDES IRIS".to_string()];
+        assert_eq!(
+            respace_from_page("12 RUE DES IRIS", &glued),
+            "12 RUE DES IRIS"
+        );
+
+        // un caractère de plus ou de moins : ce n'est pas la même ligne
+        assert_eq!(
+            respace_from_page("12 RUE DESIRISS", &page),
+            "12 RUE DESIRISS"
+        );
+
+        // deux espacements différents dans la page : on ne choisit pas
+        let doubtful = vec![
+            "8 RUE DES IRIS".to_string(),
+            "8RUE DES IRIS".to_string(),
+            "8 RUEDES IRIS".to_string(),
+        ];
+        assert_eq!(respace_from_page("8RUEDES IRIS", &doubtful), "8RUEDES IRIS");
+    }
+
+    /// Le numéro collé à son type de voie et la civilité de couple collée sont
+    /// redressés ; un identifiant, un mot qui commence comme une voie, non.
+    #[test]
+    fn glued_street_numbers_and_couples_are_unglued() {
+        assert_eq!(
+            unglue("MOU MME MONET CLAUDE\n3RUE DES IRIS\n14ALLEE DES NYMPHEAS\n27620 GIVERNY"),
+            "M OU MME MONET CLAUDE\n3 RUE DES IRIS\n14 ALLEE DES NYMPHEAS\n27620 GIVERNY"
+        );
+        assert_eq!(unglue("2BISRUE DES IRIS"), "2BIS RUE DES IRIS");
+        assert_eq!(unglue("M.OU MME KAHLO"), "M OU MME KAHLO");
+
+        // déjà espacé, ou pas une voie : rien ne change
+        assert_eq!(unglue("3 RUE DES IRIS"), "3 RUE DES IRIS");
+        assert_eq!(unglue("1ER ETAGE"), "1ER ETAGE");
+        assert_eq!(unglue("3RUELLE DES IRIS"), "3RUELLE DES IRIS");
+        assert_eq!(unglue("MOUTON CLAUDE"), "MOUTON CLAUDE");
+    }
+
+    #[test]
+    fn couples_without_civility_are_recognised() {
+        assert!(match_civilite("HENRI MATISSE OU FRIDA KAHLO"));
+        assert!(match_civilite("Madame Kahlo Frida"));
+        assert!(!match_civilite("51 RUE BERNARD ROY"));
+    }
+
+    fn line(text: &str, top: i32, left: i32, height: i32, width: i32) -> TextLine {
+        let n = text.chars().count() as i32;
+        TextLine::new(
+            text.chars()
+                .enumerate()
+                .map(|(i, c)| crate::lines::TextChar {
+                    char: c,
+                    rect: crate::lines::Rect::from_tlhw(
+                        top,
+                        left + i as i32 * width / n,
+                        height,
+                        width / n,
+                    ),
+                })
+                .collect(),
+        )
+    }
+
+    /// Un RIB dans le coin d'une feuille A4 : son texte est cadré, marge de trois lignes
+    /// comprise, et ses lignes de 20 px n'en font plus que 5 pour le détecteur ordinaire.
+    #[test]
+    fn the_text_of_a_page_is_framed_with_its_line_height() {
+        let rib = |left: i32, top: i32| -> Vec<TextLine> {
+            (0..6)
+                .map(|i| line("RELEVE D IDENTITE", top + i * 60, left, 20, 900))
+                .collect()
+        };
+
+        let a4 = DynamicImage::new_luma8(2480, 3508);
+        // six lignes de 200 à 520, bord droit à 2299 : l'aide arrondit la largeur des
+        // caractères
+        assert_eq!(
+            text_frame(&a4, &rib(1400, 200)),
+            Some(((1340, 140, 1019, 440), 20.0))
+        );
+        assert!((at_detection(&a4, 20.0) - 5.47).abs() < 0.01);
+
+        // la photo d'un RIB qui remplit l'image : le cadre est rogné à l'image, et le
+        // détecteur ordinaire voit ses lignes à peine réduites
+        let photo = DynamicImage::new_luma8(1100, 500);
+        assert_eq!(
+            text_frame(&photo, &rib(100, 60)),
+            Some(((40, 0, 1019, 440), 20.0))
+        );
+        assert!((at_detection(&photo, 20.0) - 17.45).abs() < 0.01);
+
+        // trop peu de lignes pour cadrer : toute la page
+        assert_eq!(
+            text_frame(&a4, &rib(1400, 200)[..4]),
+            Some(((0, 0, 2480, 3508), 20.0))
+        );
+        assert_eq!(text_frame(&a4, &[]), None);
+    }
+
+    /// « Intitulé du compte » à gauche, titulaire aligné à droite : le libellé est
+    /// rattaché au bloc du code postal qu'il borde, pas à un code postal plus haut ni à
+    /// un libellé posé à droite.
+    #[test]
+    fn a_label_on_the_left_of_the_block_is_found() {
+        let label = Regex::new(r"(?i)(titulaire|intitul[ée])").unwrap();
+        // code postal à x = 1000, y = 400, lignes de 20 px
+        let postal = Anchor::new(Point::new(1000, 400), Point::new(1100, 420));
+        let lines = vec![
+            line("21/01/2021", 200, 1400, 20, 200),
+            line("Intitulé du compte", 300, 100, 20, 300),
+            line("ASSOC. LES AMIS DE CEZANNE", 300, 900, 20, 600),
+            line("74103 ANNEMASSE", 400, 1000, 20, 300),
+        ];
+
+        // bord droit à un pixel près : l'aide répartit la largeur entre les caractères
+        assert_eq!(side_label(&lines, &postal, &label), Some((300, 399)));
+        // le recadrage part du libellé, pas de la date au-dessus, et va vers la gauche
+        // comme le masque aligné à droite, cinq largeurs de code postal
+        let (x, y, _, height) = side_mask(&postal, (300, 400));
+        assert_eq!((x, y, y + height), (500, 290, 430));
+        // sans passer le libellé quand il est plus près
+        assert_eq!(side_mask(&postal, (300, 700)).0, 700);
+
+        // un libellé à droite du code postal ne compte pas
+        let right = vec![line("Titulaire", 300, 1500, 20, 200)];
+        assert_eq!(side_label(&right, &postal, &label), None);
+    }
+
+    /// Des lignes blanches entre le nom et l'adresse laissent le nom au-dessus du masque
+    /// du code postal : la ligne qui désigne le bloc, la plus proche, en donne le haut.
+    #[test]
+    fn a_designation_above_the_mask_is_found() {
+        let label = Regex::new(r"(?i)(titulaire|intitul[ée])").unwrap();
+        let postal_line = postal_code();
+        // code postal à x = 1000, y = 500, lignes de 20 px : le masque monte jusqu'à 350
+        let postal = Anchor::new(Point::new(1000, 500), Point::new(1100, 520));
+        let seg = |text: &str, y0: i32| Segment {
+            x0: 1000,
+            y0,
+            x1: 1400,
+            y1: y0 + 20,
+            text: text.to_string(),
+        };
+        let page = vec![
+            seg("Nom et adresse du titulaire", 290),
+            seg("G.A.E.C. MATISSE ET KAHLO", 320),
+            seg("LIEU-DIT LES NYMPHEAS", 410),
+            seg("44100 NANTES", 500),
+        ];
+        assert_eq!(
+            designation_above(&page, &postal, &label, &postal_line),
+            Some(320)
+        );
+        let (_, y, _, height) = above_mask(&postal, 320);
+        assert_eq!((y, y + height), (310, 530));
+
+        // un nom sans forme juridique : le libellé au-dessus désigne le bloc
+        let unprefixed = vec![seg("Intitulé du compte", 290), seg("MATISSE ET KAHLO", 320)];
+        assert_eq!(
+            designation_above(&unprefixed, &postal, &label, &postal_line),
+            Some(290)
+        );
+
+        // un autre code postal entre deux : c'est un autre bloc
+        let other = vec![seg("M MONET CLAUDE", 290), seg("27620 GIVERNY", 320)];
+        assert_eq!(
+            designation_above(&other, &postal, &label, &postal_line),
+            None
+        );
+    }
+
+    /// Une page lue de haut en bas a des lignes plus hautes que larges ; une page droite
+    /// non, même avec quelques mots courts ou une étiquette verticale en marge.
+    #[test]
+    fn a_page_read_top_to_bottom_is_detected() {
+        let vertical = vec![
+            line("FR76 3000 1000 6449", 0, 0, 400, 30),
+            line("M MATISSE HENRI", 0, 40, 300, 30),
+            line("44100 NANTES", 0, 80, 250, 30),
+        ];
+        assert!(mostly_vertical(&vertical));
+
+        let upright = vec![
+            line("FR76 3000 1000 6449", 0, 0, 30, 400),
+            line("M MATISSE HENRI", 40, 0, 30, 300),
+            line("44100 NANTES", 80, 0, 30, 250),
+            line("Page 1 sur 1", 0, 900, 200, 20),
+        ];
+        assert!(!mostly_vertical(&upright));
+    }
+
+    /// Un mot coupé par le bord du recadrage est recollé d'après la page ; un mot
+    /// entier n'est jamais prolongé, et aucun mot n'est ajouté.
+    #[test]
+    fn words_cut_by_the_crop_are_completed_from_the_page() {
+        let page = vec![
+            "ASSOCIATION DES AMIS DE LA PALETTE".to_string(),
+            "IBAN FR76 3000 1000".to_string(),
+            "ASSOCIATION PALETTE ET PINCEAUX   Domiciliation".to_string(),
+            "44100 NANTES".to_string(),
+        ];
+
+        assert_eq!(
+            complete_cut_words("ATION DES AMIS DE LA PALETTE", &page),
+            "ASSOCIATION DES AMIS DE LA PALETTE"
+        );
+        assert_eq!(
+            complete_cut_words("ASSOCIATION PALETTE ET PINC\n44100 NANTES", &page),
+            "ASSOCIATION PALETTE ET PINCEAUX\n44100 NANTES"
+        );
+        // absent de la page : rien ne change
+        assert_eq!(
+            complete_cut_words("M MATISSE HENRI", &page),
+            "M MATISSE HENRI"
+        );
+        // trop court pour être situé sûrement : « DE » n'est pas prolongé
+        assert_eq!(complete_cut_words("DE", &page), "DE");
+    }
+
+    /// Libellés seuls sur leur ligne, rangée de chiffres du RIB et bruit de filet ne
+    /// font pas partie du titulaire ; ses vraies lignes restent.
+    #[test]
+    fn labels_and_noise_are_dropped_from_the_block() {
+        let text = "Titulaire du compte\n(Account Owner)\nASSOC. LES AMIS DE CEZANNE\nADRESSE :\n12 RUE DES NYMPHEAS\n44100 NANTES";
+        assert_eq!(
+            trim_holder(text, &postal_code()).as_deref(),
+            Some("ASSOC. LES AMIS DE CEZANNE\n12 RUE DES NYMPHEAS\n44100 NANTES")
+        );
+
+        assert!(is_label_or_noise("2===============k=========k==m====="));
+        assert!(is_label_or_noise("30001 00064 49190095620 88"));
+        assert!(is_label_or_noise("RIB"));
+        assert!(!is_label_or_noise("BP 10001"));
+        assert!(!is_label_or_noise("ASS FAUVE (EX NABIS)"));
+        assert!(!is_label_or_noise("ART 'NEUF' DECO 'BIS"));
+    }
+
+    /// Un RIB qui n'imprime que le nom, sans adresse : la ligne qui commence par une
+    /// civilité est le titulaire, la première de haut en bas.
+    #[test]
+    fn a_holder_printed_without_address_is_found_by_its_civility() {
+        let lines = vec![
+            line("Mode de paiement : virement", 100, 100, 20, 500),
+            line("FR76 3000 1000 6449 1900 9562 088", 200, 100, 20, 700),
+            line("BIC : BDFEFRPPCCT", 240, 100, 20, 300),
+            line("M OU MME MONET CLAUDE", 280, 100, 20, 450),
+            line("MME KAHLO FRIDA", 400, 100, 20, 300),
+        ];
+        assert_eq!(
+            civility_line(&lines).map(|l| l.to_string()).as_deref(),
+            Some("M OU MME MONET CLAUDE")
+        );
+
+        let glued = vec![line("M.OU MME MONET CLAUDE", 280, 100, 20, 450)];
+        assert!(civility_line(&glued).is_some());
+
+        // un mot qui commence comme une civilité n'en est pas une
+        let none = vec![
+            line("MONTANT DU VIREMENT", 100, 100, 20, 400),
+            line("Mme", 140, 100, 20, 60),
+        ];
+        assert!(civility_line(&none).is_none());
+    }
+
+    /// Un écran d'application : le libellé seul sur sa ligne, le titulaire en dessous,
+    /// sans civilité ni adresse, puis le champ suivant.
+    #[test]
+    fn a_holder_under_its_label_is_found() {
+        let app = vec![
+            line("Bénéficiaire", 100, 40, 20, 220),
+            line("Frida Kahlo-Rivera", 140, 40, 24, 340),
+            line("IBAN", 200, 40, 20, 80),
+            line("FR76 3000 1000 6449 1900 9562 088", 230, 40, 20, 700),
+        ];
+        assert_eq!(
+            under_label(&app).map(|(h, (x, y, _, height))| (h, x, y, height)),
+            Some(("Frida Kahlo-Rivera".to_string(), 40, 140, 24))
+        );
+
+        // un trait de séparation sous le libellé, puis un nom sur deux lignes
+        let separated = vec![
+            line("Beneficiary", 100, 40, 20, 200),
+            line("ATELIER MONET", 160, 40, 20, 260),
+            line("GIVERNY", 185, 40, 20, 150),
+            line("RIB", 260, 40, 20, 60),
+        ];
+        assert_eq!(
+            under_label(&separated).map(|(h, _)| h).as_deref(),
+            Some("ATELIER MONET\nGIVERNY")
+        );
+
+        // une ligne lue en deux morceaux, le second d'abord ; le code postal ferme le bloc
+        let split = vec![
+            line("TITULAIRE DU COMPTE :", 100, 40, 20, 300),
+            line("REGIE DES ATELIERS", 139, 600, 20, 300),
+            line("ECOLE DES BEAUX-ARTS", 140, 40, 20, 520),
+            line("12 RUE DE GIVERNY", 170, 40, 20, 300),
+            line("27620 GIVERNY", 200, 40, 20, 220),
+            line("MUSEE DES IMPRESSIONNISTES", 230, 40, 20, 400),
+        ];
+        assert_eq!(
+            under_label(&split).map(|(h, _)| h).as_deref(),
+            Some("ECOLE DES BEAUX-ARTS REGIE DES ATELIERS\n12 RUE DE GIVERNY\n27620 GIVERNY")
+        );
+
+        // photo de travers : la ligne du dessous, qui part du même bord, n'est pas un
+        // morceau de la rangée ; le code postal lu seul, puis sa ville
+        let skewed = vec![
+            line("TITULAIRE DU COMPTE", 100, 40, 24, 300),
+            line("AMIS DU MUSEE DE GIVERNY", 140, 40, 36, 600),
+            line("MAIRIE", 160, 42, 20, 90),
+            line("12 RUE DE GIVERNY", 190, 40, 24, 300),
+            line("27620", 218, 40, 16, 80),
+            line("GIVERNY", 240, 40, 24, 150),
+            line("Cadre réservé au destinataire", 360, 40, 24, 400),
+        ];
+        assert_eq!(
+            under_label(&skewed).map(|(h, _)| h).as_deref(),
+            Some("AMIS DU MUSEE DE GIVERNY\nMAIRIE\n12 RUE DE GIVERNY\n27620\nGIVERNY")
+        );
+
+        // le champ suivant s'annonce par ses deux-points
+        let next = vec![
+            line("Titulaire du compte", 100, 40, 20, 300),
+            line("ATELIER MONET SARL", 130, 40, 20, 300),
+            line("Intitulé du sous-compte :", 160, 40, 20, 400),
+        ];
+        assert_eq!(
+            under_label(&next).map(|(h, _)| h).as_deref(),
+            Some("ATELIER MONET SARL")
+        );
+
+        // sous le libellé, le champ suivant ; à côté, une autre colonne
+        let empty = vec![
+            line("Titulaire du compte", 100, 40, 20, 300),
+            line("Paul Cezanne", 110, 900, 20, 240),
+            line("IBAN", 140, 40, 20, 80),
+        ];
+        assert_eq!(under_label(&empty), None);
+
+        // le titulaire à droite du libellé n'est pas un libellé seul
+        let inline = vec![
+            line("Titulaire du compte : Paul Cezanne", 100, 40, 20, 600),
+            line("Banque : Atelier", 140, 40, 20, 300),
+        ];
+        assert_eq!(under_label(&inline), None);
+    }
+
+    /// Une forme juridique en tête de ligne tient lieu de civilité : c'est le début du
+    /// titulaire d'une personne morale.
+    #[test]
+    fn a_legal_form_anchors_a_company_holder() {
+        let text =
+            "Intitulé du compte\nASSOC. LES AMIS DE CEZANNE\n12 RUE DES NYMPHEAS\n44100 NANTES";
+        assert_eq!(
+            trim_holder(text, &postal_code()).as_deref(),
+            Some("ASSOC. LES AMIS DE CEZANNE\n12 RUE DES NYMPHEAS\n44100 NANTES")
+        );
+        assert!(match_civilite("SARL LES FAUVES"));
+        // en minuscules ou au milieu d'une ligne, ce n'est pas une forme juridique
+        assert!(!match_civilite("la classe de 2nde"));
+        assert!(!match_civilite("CODE BANQUE SAS 12345"));
+    }
+
+    /// Le sigle à points vaut la forme juridique : « G.A.E.C. » comme « GAEC ».
+    #[test]
+    fn a_dotted_legal_form_anchors_a_company_holder() {
+        let text =
+            "Intitulé du compte\nG.A.E.C. MATISSE ET KAHLO\nLIEU-DIT LES NYMPHEAS\n44100 NANTES";
+        assert_eq!(
+            trim_holder(text, &postal_code()).as_deref(),
+            Some("G.A.E.C. MATISSE ET KAHLO\nLIEU-DIT LES NYMPHEAS\n44100 NANTES")
+        );
+        assert!(match_civilite("E.A.R.L. MONET ET CEZANNE"));
+        assert!(match_civilite("S.A.S MATISSE - ATELIER KAHLO"));
+        assert!(!match_civilite("CODE BANQUE S.A.S. 12345"));
+    }
+
+    /// Le compte d'une collectivité est tenu par son comptable public : c'est lui le
+    /// titulaire imprimé, sans civilité ni forme juridique.
+    #[test]
+    fn a_public_accountant_anchors_the_holder() {
+        let text = "Banque de France\nTRESORERIE DE GIVERNY-LES-NYMPHEAS\n12 RUE DES NYMPHEAS\n44100 NANTES";
+        assert_eq!(
+            trim_holder(text, &postal_code()).as_deref(),
+            Some("TRESORERIE DE GIVERNY-LES-NYMPHEAS\n12 RUE DES NYMPHEAS\n44100 NANTES")
+        );
+        assert!(match_civilite(
+            "Service de Gestion comptable de Giverny-les-Nympheas"
+        ));
+        assert!(match_civilite("Trésorerie De Giverny-les-Nympheas"));
+        // déformée par l'OCR d'un scan, elle se reconnaît à son début
+        assert!(match_civilite("TRESORBRIE\nDE GIVERNY-LES-NYMPHEAS"));
+        assert!(!match_civilite("TRESOR PUBLIC GIVERNY-LES-NYMPHEAS"));
+        assert!(match_civilite(
+            "PAIERIE DEPARTEMENTALE DU GIVERNY-LES-NYMPHEAS"
+        ));
+        // le teneur d'un compte du Trésor public, à la place de l'agence
+        assert!(!match_civilite(
+            "Direction Régionale des Finances Publiques"
+        ));
+        // un sigle plus long n'est pas un service de gestion comptable
+        assert!(!match_civilite("SGCB AGENCE DU PORT"));
+    }
 }

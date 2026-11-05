@@ -3,7 +3,7 @@ use std::env::{current_dir, var};
 use image::{imageops::fast_blur, DynamicImage, GrayImage, ImageBuffer, Luma, Rgb};
 use imageproc::{
     edges::canny,
-    geometric_transformations::{warp_into, Interpolation, Projection},
+    geometric_transformations::{warp_into, Border, Interpolation, Projection},
     hough::{detect_lines, draw_polar_lines, LineDetectionOptions, PolarLine},
     map::map_pixels,
     morphology::{grayscale_dilate, Mask},
@@ -19,6 +19,10 @@ const GREEN: Rgb<u8> = Rgb::<u8>([0, 255, 0]);
 const BLACK: Rgb<u8> = Rgb::<u8>([0, 0, 0]);
 
 pub fn only_rotate(image: &DynamicImage, name: &str) -> DynamicImage {
+    crate::timing::measure(crate::timing::preprocess, || only_rotate_inner(image, name))
+}
+
+fn only_rotate_inner(image: &DynamicImage, name: &str) -> DynamicImage {
     let whithout_shadow_image = remove_shadows(image, name);
     let angle = angle(&whithout_shadow_image, name);
 
@@ -26,6 +30,29 @@ pub fn only_rotate(image: &DynamicImage, name: &str) -> DynamicImage {
 }
 
 pub fn clean_image(image: &DynamicImage, name: &str) -> DynamicImage {
+    crate::timing::measure(crate::timing::preprocess, || clean_image_inner(image, name))
+}
+
+/// Plus grand côté de l'image sur laquelle on estime l'inclinaison. Une photo de
+/// téléphone fait douze mégapixels : Canny, Hough et la suppression d'ombre y coûtaient
+/// jusqu'à trois secondes et demie. Mesuré à 1600, l'angle perdait en précision sur les
+/// photos déjà modestes — deux IBAN de photos inclinées ; au-delà de 2400, il n'y a
+/// que les grandes photos, où se trouve le gain.
+const ANGLE_ESTIMATION_SIDE: u32 = 2400;
+
+fn clean_image_inner(image: &DynamicImage, name: &str) -> DynamicImage {
+    // La seconde passe travaille elle aussi sur l'image plafonnée : rotation et
+    // suppression d'ombre en pleine résolution coûtaient encore plus d'une seconde, et à
+    // 2400 px la capitale d'une photo de téléphone garde une trentaine de pixels.
+    let image = &if image.width().max(image.height()) > ANGLE_ESTIMATION_SIDE {
+        image.resize(
+            ANGLE_ESTIMATION_SIDE,
+            ANGLE_ESTIMATION_SIDE,
+            image::imageops::FilterType::Triangle,
+        )
+    } else {
+        image.clone()
+    };
     let whithout_shadow_image = remove_shadows(image, name);
     let angle = angle(&whithout_shadow_image, name);
 
@@ -136,6 +163,56 @@ fn angle(image: &DynamicImage, name: &str) -> f32 {
     (angle - 90.0).to_radians() as f32
 }
 
+/// Projection appliquée par [`rotate`] : rotation autour du centre, sur un canevas
+/// agrandi pour ne rien perdre. Exposée pour transporter une position connue — une ancre
+/// — dans l'image tournée sans la redétecter.
+pub fn rotation_projection(width: u32, height: u32, theta: f32) -> Projection {
+    let (width, height) = (width as f32, height as f32);
+    let (new_width, new_height) = (
+        (width * theta.cos().abs() + height * theta.sin().abs()),
+        (height * theta.cos().abs() + width * theta.sin().abs()),
+    );
+
+    let (cx, cy) = (width / 2f32, height / 2f32);
+    let (new_cx, new_cy) = ((new_width / 2f32), (new_height / 2f32));
+
+    Projection::translate(new_cx, new_cy)
+        * Projection::rotate(theta)
+        * Projection::translate(-cx, -cy)
+}
+
+/// Rectangle englobant d'un rectangle transporté par [`rotation_projection`].
+pub fn rotate_rect(
+    (x, y, w, h): (u32, u32, u32, u32),
+    width: u32,
+    height: u32,
+    theta: f32,
+) -> (u32, u32, u32, u32) {
+    let projection = rotation_projection(width, height, theta);
+    let corners = [
+        (x as f32, y as f32),
+        ((x + w) as f32, y as f32),
+        ((x + w) as f32, (y + h) as f32),
+        (x as f32, (y + h) as f32),
+    ];
+
+    let mapped: Vec<(f32, f32)> = corners
+        .iter()
+        .map(|&(px, py)| projection * (px, py))
+        .collect();
+    let min_x = mapped.iter().map(|p| p.0).fold(f32::MAX, f32::min).max(0.0);
+    let min_y = mapped.iter().map(|p| p.1).fold(f32::MAX, f32::min).max(0.0);
+    let max_x = mapped.iter().map(|p| p.0).fold(f32::MIN, f32::max);
+    let max_y = mapped.iter().map(|p| p.1).fold(f32::MIN, f32::max);
+
+    (
+        min_x as u32,
+        min_y as u32,
+        (max_x - min_x).max(1.0) as u32,
+        (max_y - min_y).max(1.0) as u32,
+    )
+}
+
 pub fn rotate(image: &DynamicImage, theta: f32) -> DynamicImage {
     let image = image.to_rgb8();
 
@@ -145,19 +222,14 @@ pub fn rotate(image: &DynamicImage, theta: f32) -> DynamicImage {
         (height * theta.cos().abs() + width * theta.sin().abs()),
     );
 
-    let (cx, cy) = (width / 2f32, height / 2f32);
-    let (new_cx, new_cy) = ((new_width / 2f32), (new_height / 2f32));
-
     let mut new_image = ImageBuffer::from_pixel(new_width as u32, new_height as u32, WHITE);
-    let projection = Projection::translate(new_cx, new_cy)
-        * Projection::rotate(theta)
-        * Projection::translate(-cx, -cy);
+    let projection = rotation_projection(image.width(), image.height(), theta);
 
     warp_into(
         &image,
-        &projection,
+        projection,
         Interpolation::Bicubic,
-        WHITE,
+        Border::Constant(WHITE),
         &mut new_image,
     );
 
@@ -216,7 +288,7 @@ pub fn resize(img: &DynamicImage, initial_height: u32, target_height: u32) -> Dy
 }
 
 fn draw_lines(edges: &DynamicImage, lines: &[PolarLine], name: &str) {
-    let color_edges = map_pixels(edges, |_x, _y, p| if p[0] > 0 { WHITE } else { BLACK });
+    let color_edges = map_pixels(&edges.to_luma8(), |p| if p[0] > 0 { WHITE } else { BLACK });
     let lines_image = draw_polar_lines(&color_edges, lines, GREEN);
     save_image_in_debug(&lines_image.into(), name, "lines");
 }
@@ -244,4 +316,52 @@ pub fn save_image_in_debug(image: &DynamicImage, name: &str, suffix: &str) {
     image
         .save(debug_dir.join(format!("{}_{}.png", name, suffix)))
         .unwrap_or_else(|e| panic!("Failed to save image: {}, {}", name, e));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_rect_rotated_by_zero_is_itself() {
+        assert_eq!(
+            rotate_rect((10, 20, 30, 40), 200, 100, 0.0),
+            (10, 20, 30, 40)
+        );
+    }
+
+    /// Un quart de tour échange largeur et hauteur du rectangle, et le canevas s'élargit
+    /// pour tout contenir : le rectangle reste dans les bornes.
+    #[test]
+    fn a_quarter_turn_swaps_the_sides() {
+        let (_, _, w, h) = rotate_rect((10, 20, 30, 40), 200, 100, std::f32::consts::FRAC_PI_2);
+
+        assert!((w as i32 - 40).abs() <= 1, "w={}", w);
+        assert!((h as i32 - 30).abs() <= 1, "h={}", h);
+    }
+
+    /// Le rectangle transporté doit correspondre à l'image transportée : on vérifie que
+    /// le centre du rectangle tourné est le centre de l'original passé par la même
+    /// projection.
+    #[test]
+    fn the_transported_rect_follows_the_image() {
+        let theta = 0.3;
+        let (x, y, w, h) = rotate_rect((50, 60, 20, 10), 300, 200, theta);
+        let center = ((x + w / 2) as f32, (y + h / 2) as f32);
+
+        let expected = rotation_projection(300, 200, theta) * (60.0, 65.0);
+
+        assert!(
+            (center.0 - expected.0).abs() < 2.0,
+            "{:?} vs {:?}",
+            center,
+            expected
+        );
+        assert!(
+            (center.1 - expected.1).abs() < 2.0,
+            "{:?} vs {:?}",
+            center,
+            expected
+        );
+    }
 }

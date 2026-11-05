@@ -13,12 +13,10 @@ use tokio::sync::Semaphore;
 
 use crate::config::AppConfig;
 use crate::http::analyze::AnalysisError;
-use crate::pool::{LepTessPool, OcrEnginePool};
+use crate::pool::init_leptess_pool;
 
 pub struct AppState {
     pub semaphore: Arc<Semaphore>,
-    pub leptess_pool: Arc<LepTessPool>,
-    pub ocr_engine_pool: Arc<OcrEnginePool>,
     pub ocr_timeout_secs: u64,
     pub max_file_size: usize,
 }
@@ -31,10 +29,12 @@ pub async fn main() -> std::io::Result<()> {
 
     let config = AppConfig::from_env();
 
+    // autant d'instances Tesseract que d'analyses concurrentes ; PP-OCR, lui, partage
+    // une seule session ONNX Runtime entre threads
+    init_leptess_pool(config.max_concurrent_ocr);
+
     let state = web::Data::new(AppState {
         semaphore: Arc::new(Semaphore::new(config.max_concurrent_ocr)),
-        leptess_pool: Arc::new(LepTessPool::new(config.max_concurrent_ocr)),
-        ocr_engine_pool: Arc::new(OcrEnginePool::new(config.max_concurrent_ocr)),
         ocr_timeout_secs: config.ocr_timeout_secs,
         max_file_size: config.max_file_size,
     });

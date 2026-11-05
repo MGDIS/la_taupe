@@ -53,6 +53,23 @@ impl Anchor {
         (x, y, wrapping_width, wrapping_height)
     }
 
+    /// Zone autour du libellé « BIC » : le code est à sa droite ou en dessous, parfois
+    /// dans un tableau à une lettre par cellule, et souvent séparé du libellé par plus
+    /// d'une ligne. Une demi-largeur à gauche pour l'encadrement, douze largeurs à
+    /// droite, une ligne au-dessus et cinq en dessous.
+    pub fn bic_mask(&self) -> (u32, u32, u32, u32) {
+        let x = self
+            .top_left
+            .x
+            .saturating_sub((self.width as f32 * 0.5) as u32);
+        let y = self.top_left.y.saturating_sub(self.height);
+
+        let wrapping_width = self.width * 12;
+        let wrapping_height = self.height * 7;
+
+        (x, y, wrapping_width, wrapping_height)
+    }
+
     pub fn addr_mask(&self) -> (u32, u32, u32, u32) {
         let x = self
             .top_left
@@ -95,7 +112,11 @@ impl Anchor {
             .y
             .saturating_sub((self.height as f32 * 0.5) as u32);
 
-        let wrapping_width = self.width * 10;
+        // 8 largeurs d'ancre et pas 10 : un nom et son adresse tiennent dedans, la
+        // domiciliation ferrée à droite de la page en sort — à 10, ses fragments se
+        // collaient aux lignes du titulaire dans le recadrage ; à 6, deux noms longs
+        // se coupaient
+        let wrapping_width = self.width * 8;
         let wrapping_height = self.height * 4;
 
         (x, y, wrapping_width, wrapping_height)
